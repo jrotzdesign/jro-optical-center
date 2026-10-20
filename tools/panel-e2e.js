@@ -1,0 +1,189 @@
+// End-to-end check of the installed panel inside real Illustrator, through the CEP debug port.
+// Needs: Illustrator running with the Optical Center panel open. The script opens a temporary copy
+// of test/fixtures/optical-center-test.ai (the committed fixture is never modified, and your open
+// files are not touched) and closes it unsaved at the end. Run: node tools/panel-e2e.js [screenshotDir]
+// It clicks the real buttons and fails on any console error. Undo is a real Cmd+Z keystroke when
+// macOS allows it (Accessibility permission for the terminal), otherwise Illustrator's Edit > Undo.
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
+
+const SHOTS = process.argv[2] || null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function connect() {
+  const targets = await (await fetch('http://localhost:8733/json')).json();
+  const t = targets.find((x) => x.type === 'page');
+  if (!t) throw new Error('Optical Center panel is not open (no target on port 8733)');
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  let id = 0;
+  const pending = new Map();
+  const problems = [];
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); return; }
+    if (msg.method === 'Runtime.exceptionThrown') problems.push('exception: ' + JSON.stringify(msg.params.exceptionDetails.exception?.description || msg.params.exceptionDetails.text));
+    if (msg.method === 'Runtime.consoleAPICalled' && (msg.params.type === 'error' || msg.params.type === 'assert')) problems.push('console.error: ' + msg.params.args.map((a) => a.value ?? a.description).join(' '));
+    if (msg.method === 'Log.entryAdded' && msg.params.entry.level === 'error') problems.push('log.error: ' + msg.params.entry.text);
+  };
+  await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
+  const send = (method, params = {}) => new Promise((r) => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+  await send('Runtime.enable');
+  await send('Log.enable');
+  const evaluate = async (expression) => {
+    const res = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+    if (res.result.exceptionDetails) throw new Error('panel eval failed: ' + (res.result.exceptionDetails.exception?.description || res.result.exceptionDetails.text));
+    return res.result.result.value;
+  };
+  return { ws, send, evaluate, problems };
+}
+
+(async () => {
+  const p = await connect();
+  const host = (jsx) => p.evaluate(`new Promise(r => window.__adobe_cep__.evalScript(${JSON.stringify(jsx)}, r))`);
+  const hostJSON = async (jsx) => JSON.parse(await host(jsx));
+  const panel = () => p.evaluate(`JSON.stringify({ live: document.getElementById('live').innerText, status: document.getElementById('status').innerText, hint: !document.getElementById('textHint').classList.contains('hidden'), disabled: document.getElementById('goBoth').disabled })`).then(JSON.parse);
+  const click = (id) => p.evaluate(`document.getElementById('${id}').click(); true`);
+  // An action clears the status line when it starts and writes it when it ends.
+  const waitIdle = async () => { for (let i = 0; i < 80; i++) { await sleep(150); if (await p.evaluate('document.getElementById("status").innerText.trim() !== ""')) break; } await sleep(300); };
+  const select = (names) => host(`(function(){var d=app.activeDocument;d.selection=null;${names.map((n) => `d.pageItems.getByName(${JSON.stringify(n)}).selected=true;`).join('')}return d.selection.length;})()`);
+  const bounds = (name) => hostJSON(`(function(){var b=app.activeDocument.pageItems.getByName(${JSON.stringify(name)}).geometricBounds;return '['+b.join(',')+']';})()`);
+  const docs = () => host('app.documents.length + ""').then(Number);
+  let undoMethod = null;
+  const cmdZ = async () => {
+    try {
+      execFileSync('osascript', ['-e', 'tell application "Adobe Illustrator" to activate', '-e', 'delay 0.4', '-e', 'tell application "System Events" to keystroke "z" using command down'], { stdio: 'pipe' });
+      undoMethod = undoMethod || 'Cmd+Z keystroke';
+    } catch (e) {
+      await host('app.executeMenuCommand("undo"); "ok"');
+      undoMethod = 'Edit > Undo menu command (keystrokes not allowed for this terminal)';
+    }
+  };
+  const shot = (name) => {
+    if (!SHOTS) return null;
+    execFileSync('osascript', ['-e', 'tell application "Adobe Illustrator" to activate', '-e', 'delay 0.6']);
+    const f = path.join(SHOTS, name + '.png');
+    execFileSync('screencapture', ['-x', f]);
+    return f;
+  };
+  const near = (a, b, tol = 0.05) => Math.abs(a - b) <= tol;
+  const results = [];
+  const check = (name, ok, detail) => { results.push({ name, ok: !!ok, detail }); };
+
+  // Setup: open a temporary copy of the committed fixture; everything below runs on it.
+  const userDoc = await host('app.documents.length ? app.activeDocument.name : ""');
+  const repo = path.resolve(__dirname, '..');
+  const tmpDir = require('node:fs').mkdtempSync(path.join(require('node:os').tmpdir(), 'optical-center-e2e-'));
+  const copyPath = path.join(tmpDir, 'optical-center-e2e.ai');
+  require('node:fs').copyFileSync(path.join(repo, 'test', 'fixtures', 'optical-center-test.ai'), copyPath);
+  const testDoc = await host(`app.open(new File(${JSON.stringify(copyPath)})).name`);
+  const missing = await host('(function(){var m=[],n=["play","star","J","hole","stroke-L","container-1","container-2","container-3","container-4","container-5"];for(var i=0;i<n.length;i++){try{app.activeDocument.pageItems.getByName(n[i]);}catch(e){m.push(n[i]);}}return m.join(",");})()');
+  if (missing) throw new Error('fixture copy is missing: ' + missing);
+  await sleep(800);
+
+  // 0. Loaded properly
+  check('window.Optical is loaded in CEP', await p.evaluate('typeof window.Optical === "object" && typeof window.Optical.planMove === "function"'));
+
+  // 1. Layout fits without scrolling: at the panel's current size and at the manifest default 268 x 340
+  const cur = await p.evaluate('JSON.stringify({ h: innerHeight, w: innerWidth, content: document.documentElement.scrollHeight })').then(JSON.parse);
+  check('fits at current size ' + cur.w + 'x' + cur.h, cur.content <= cur.h, cur);
+  await p.send('Emulation.setDeviceMetricsOverride', { width: 268, height: 340, deviceScaleFactor: 0, mobile: false });
+  await sleep(200);
+  const def = await p.evaluate('JSON.stringify({ h: innerHeight, w: innerWidth, content: document.documentElement.scrollHeight, buttonBottom: document.getElementById("goV").getBoundingClientRect().bottom })').then(JSON.parse);
+  check('fits at default 268x340 (Advanced closed)', def.content <= def.h, def);
+  await p.send('Emulation.clearDeviceMetricsOverride');
+
+  // 2. Nothing selected: buttons disabled, plain instruction
+  await select([]);
+  await sleep(1800);
+  let s = await panel();
+  check('nothing selected: buttons off and a plain instruction', s.disabled && /Select a shape and the shape to center it in/.test(s.live), s.live);
+
+  // 3. Triangle + circle (circle behind): the triangle moves right, one Cmd+Z reverts it
+  const docsBefore = await docs();
+  const triBefore = await bounds('play'), circBefore = await bounds('container-1');
+  await select(['container-1', 'play']);
+  await sleep(1800);
+  s = await panel();
+  check('live line names what will happen', /play centers inside container-1/i.test(s.live) && !s.disabled, s.live);
+  const before = shot('1-before');
+  await click('goBoth');
+  await waitIdle();
+  s = await panel();
+  const triAfter = await bounds('play'), circAfter = await bounds('container-1');
+  const dx = triAfter[0] - triBefore[0];
+  // The triangle starts box-centered; at 60% bias its optical point sits 8 pt left of the box center.
+  check('one click moves the triangle 8 pt right', near(dx, 8, 0.01) && near(triAfter[1], triBefore[1]), { dx: dx.toFixed(3), status: s.status });
+  check('the circle (back-most) stays put', circAfter.every((v, i) => near(v, circBefore[i])), circAfter);
+  check('no new document appeared', (await docs()) === docsBefore);
+  const after = shot('2-after');
+  await cmdZ();
+  await sleep(1200);
+  const triUndo = await bounds('play');
+  check('one Cmd+Z reverts the move', triUndo.every((v, i) => near(v, triBefore[i])), { triUndo, triBefore });
+
+  // 4. Container above the subject: the back-most (now the triangle) stays, the circle moves
+  await host('app.activeDocument.pageItems.getByName("container-1").zOrder(ZOrderMethod.BRINGTOFRONT); "ok"');
+  await select(['container-1', 'play']);
+  await sleep(3500); // the peek cache expires every 3 s after a restack
+  s = await panel();
+  check('container above: live line says the circle moves into the triangle', /container-1 centers inside play/i.test(s.live), s.live);
+  const c2 = await bounds('container-1'), t2 = await bounds('play');
+  await click('goBoth');
+  await waitIdle();
+  const c3 = await bounds('container-1'), t3 = await bounds('play');
+  check('container above: the back-most triangle stays, the circle moves', t3.every((v, i) => near(v, t2[i])) && Math.abs(c3[0] - c2[0]) > 0.5, { circleDx: (c3[0] - c2[0]).toFixed(3) });
+  await cmdZ(); await sleep(1000);
+  const c4 = await bounds('container-1');
+  check('container above: one Cmd+Z reverts', c4.every((v, i) => near(v, c2[i])));
+  await cmdZ(); await sleep(1000); // undo the restack too
+
+  // 5. Single object centers on its artboard
+  await select(['star']);
+  await sleep(1800);
+  s = await panel();
+  check('one object: live line says artboard', /star centers on the artboard/i.test(s.live), s.live);
+  const starBefore = await bounds('star');
+  await click('goBoth');
+  await waitIdle();
+  const read = await hostJSON('OC_read("","")');
+  const plan = await p.evaluate(`JSON.stringify(Optical.planMove(${JSON.stringify(read)}, { bias: 0.6, axis: 'both' }))`).then(JSON.parse);
+  check('one object: its optical point now sits on the artboard center', plan.deltas.every((d) => near(d.dx, 0, 0.01) && near(d.dy, 0, 0.01)), plan.deltas);
+  check('one object: no scratch document for shapes', read.usedScratch === false);
+  await cmdZ(); await sleep(1000);
+  const starUndo = await bounds('star');
+  check('one object: one Cmd+Z reverts', starUndo.every((v, i) => near(v, starBefore[i])));
+
+  // 6. Live text shows the hint and still works (a brief scratch document is allowed here only)
+  await select(['container-3', 'J']);
+  await sleep(1800);
+  s = await panel();
+  check('text selected: the outline hint shows', s.hint, s.live);
+  const jBefore = await bounds('J');
+  await click('goBoth');
+  await waitIdle();
+  s = await panel();
+  const jAfter = await bounds('J');
+  check('text: moves and the scratch document is gone again', !jAfter.every((v, i) => near(v, jBefore[i])) && (await docs()) === docsBefore, s.status);
+  await cmdZ(); await sleep(1000);
+  check('text: one Cmd+Z reverts', (await bounds('J')).every((v, i) => near(v, jBefore[i])));
+
+  // 7. Errors read as plain English
+  await select(['container-1', 'play']);
+  await click('setKey');
+  await sleep(800);
+  s = await panel();
+  check('Set key with two selected: plain English', /Select just one object, then press Set key\./.test(s.status), s.status);
+
+  await select([]);
+  await sleep(1200);
+  check('no console errors during the run', p.problems.length === 0, p.problems);
+
+  // Teardown: close the setup document unsaved and go back to the user's file.
+  await host(`(function(){var d=app.documents.getByName(${JSON.stringify(testDoc)});d.close(SaveOptions.DONOTSAVECHANGES);${userDoc ? `try{app.activeDocument=app.documents.getByName(${JSON.stringify(userDoc)});}catch(e){}` : ''}return "ok";})()`);
+
+  console.log(JSON.stringify({ testDoc, undoMethod, results, screenshots: [before, after].filter(Boolean) }, null, 1));
+  const failed = results.filter((r) => !r.ok);
+  console.log(failed.length ? `FAILED ${failed.length} of ${results.length}` : `ALL ${results.length} PASSED`);
+  p.ws.close();
+  process.exit(failed.length ? 1 : 0);
+})().catch((e) => { console.error('E2E ERROR', e); process.exit(2); });

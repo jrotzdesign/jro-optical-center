@@ -122,7 +122,8 @@ test('opticalPoint: an excluded axis comes back null', () => {
   close(opticalPoint(playBBox, playCentroid, 0.6, 'h').x, 32);
 });
 
-// Circle container (top of the z-order) with a play triangle inside it.
+// Play triangle in front of a circle container. Items are passed topmost first, so the
+// circle (the back-most object) comes last and is the container.
 // Triangle (50,50) (50,150) (130,100): bbox center = (90, 100), centroid = (230/3, 100).
 //   optical x at bias 0.6 = 90 + 0.6 * (230/3 - 90) = 90 + 0.6 * (-40/3) = 90 - 8 = 82.
 //   Circle optical point = (100, 100). Container mode: dx = 100 - 82 = 18, dy = 100 - 100 = 0.
@@ -132,24 +133,30 @@ const circle = { bbox: { minX: 0, minY: 0, maxX: 200, maxY: 200 }, centroid: { x
 const triangle = { bbox: { minX: 50, minY: 50, maxX: 130, maxY: 150 }, centroid: { x: 230 / 3, y: 100 } };
 const artboard = { minX: 0, minY: 0, maxX: 400, maxY: 400 };
 
-test('moveDelta container: the rest move into the container, which stays put', () => {
-  const d = moveDelta({ mode: 'container', items: [circle, triangle], bias: 0.6, axis: 'both' });
-  assert.deepEqual(d[0], { dx: 0, dy: 0 });
-  close(d[1].dx, 18);
-  close(d[1].dy, 0);
-});
-
-test('moveDelta key: the key stays put and everything else moves to it', () => {
-  const d = moveDelta({ mode: 'key', items: [circle, triangle], keyIndex: 1, bias: 0.6, axis: 'both' });
+test('moveDelta container: the back-most object is the container and stays put', () => {
+  const d = moveDelta({ mode: 'container', items: [triangle, circle], bias: 0.6, axis: 'both' });
   assert.deepEqual(d[1], { dx: 0, dy: 0 });
-  close(d[0].dx, -18);
+  close(d[0].dx, 18);
   close(d[0].dy, 0);
 });
 
-test('moveDelta key: with no key it falls back to the topmost object', () => {
-  const d = moveDelta({ mode: 'key', items: [circle, triangle], bias: 0.6, axis: 'both' });
+test('moveDelta container: when the circle is in front, the back-most triangle is the container', () => {
+  const d = moveDelta({ mode: 'container', items: [circle, triangle], bias: 0.6, axis: 'both' });
+  assert.deepEqual(d[1], { dx: 0, dy: 0 });
+  close(d[0].dx, -18); // circle optical x 100 moves to triangle optical x 82
+});
+
+test('moveDelta key: the key stays put and everything else moves to it', () => {
+  const d = moveDelta({ mode: 'key', items: [triangle, circle], keyIndex: 0, bias: 0.6, axis: 'both' });
   assert.deepEqual(d[0], { dx: 0, dy: 0 });
-  close(d[1].dx, 18);
+  close(d[1].dx, -18);
+  close(d[1].dy, 0);
+});
+
+test('moveDelta key: with no key it falls back to the back-most object', () => {
+  const d = moveDelta({ mode: 'key', items: [triangle, circle], bias: 0.6, axis: 'both' });
+  assert.deepEqual(d[1], { dx: 0, dy: 0 });
+  close(d[0].dx, 18);
 });
 
 test('moveDelta artboard: each item moves its optical point to the artboard center', () => {

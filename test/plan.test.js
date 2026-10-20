@@ -8,9 +8,9 @@ const shape = (paths, evenodd = false) => ({ evenodd, paths });
 const close = (actual, expected, eps = 1e-6) =>
   assert.ok(Math.abs(actual - expected) < eps, `${actual} is not within ${eps} of ${expected}`);
 
-// Same fixture as the moveDelta tests, but arriving as raw read data:
-// square container 0..200 (optical point 100,100) and the triangle (50,50) (50,150) (130,100).
-// At bias 0.6 the triangle's optical x is 82 (see optical.test.js), so the container-mode dx is 18.
+// Square container 0..200 (optical point 100,100) and the triangle (50,50) (50,150) (130,100).
+// At bias 0.6 the triangle's optical x is 82 (see optical.test.js), so moving it into the
+// container is dx = 18, and moving the container onto it is dx = -18.
 const container = {
   label: 'container', isKey: false, fingerprint: 'c', warnings: [],
   shapes: [shape([poly([[0, 0], [200, 0], [200, 200], [0, 200]])])],
@@ -19,7 +19,9 @@ const triangle = {
   label: 'play', isKey: false, fingerprint: 't', warnings: [],
   shapes: [shape([poly([[50, 50], [130, 100], [50, 150]])])],
 };
+// items are topmost first, as the engine sends them
 const read = (items, extra = {}) => ({ items, artboards: [[0, 400, 600, 0]], activeArtboard: 0, ...extra });
+const opts = { bias: 0.6, axis: 'both' };
 
 const shifted = (item, dx) => ({
   ...item,
@@ -36,65 +38,77 @@ const shifted = (item, dx) => ({
   })),
 });
 
-test('planMove key: the keyed triangle stays and the container moves 18 left', () => {
-  const keyed = { ...triangle, isKey: true };
-  const plan = planMove(read([container, keyed]), { mode: 'key', bias: 0.6, axis: 'both' });
-  close(plan.deltas[0].dx, -18); // triangle optical x 82 minus container optical x 100
+test('two objects: the back-most is the container, the triangle moves 18 right', () => {
+  const plan = planMove(read([triangle, container]), opts);
+  assert.equal(plan.error, undefined);
+  assert.deepEqual(plan.fingerprints, ['t', 'c']);
+  close(plan.deltas[0].dx, 18);
   close(plan.deltas[0].dy, 0);
   assert.deepEqual(plan.deltas[1], { dx: 0, dy: 0 });
+  assert.deepEqual(plan.summary, { mode: 'container', anchor: 'container', movers: ['play'] });
+});
+
+test('two objects with the container in front: the back-most triangle stays, the container moves', () => {
+  const plan = planMove(read([container, triangle]), opts);
+  close(plan.deltas[0].dx, -18);
+  assert.deepEqual(plan.deltas[1], { dx: 0, dy: 0 });
+  assert.deepEqual(plan.summary, { mode: 'container', anchor: 'play', movers: ['container'] });
+});
+
+test('a keyed object overrides the back-most rule', () => {
+  const keyed = { ...triangle, isKey: true };
+  const plan = planMove(read([keyed, container]), opts);
+  assert.deepEqual(plan.deltas[0], { dx: 0, dy: 0 });
+  close(plan.deltas[1].dx, -18);
+  assert.deepEqual(plan.summary, { mode: 'key', anchor: 'play', movers: ['container'] });
   assert.equal(plan.warnings.length, 0);
 });
 
-test('planMove key: with no key it uses the topmost object and says so', () => {
-  const plan = planMove(read([container, triangle]), { mode: 'key', bias: 0.6, axis: 'both' });
-  close(plan.deltas[1].dx, 18);
-  assert.match(plan.warnings.join(' '), /No key/);
-});
-
-test('planMove artboard: uses the artboard that holds the object, else the active one', () => {
+test('one object: centers on the artboard that holds it, else the active one', () => {
   const two = { artboards: [[0, 400, 600, 0], [700, 400, 1300, 0]], activeArtboard: 0 };
   // Shifted 700 right: optical point (782, 100). Artboard 2 center is (1000, 200).
-  const inside = planMove(read([shifted(triangle, 700)], two), { mode: 'artboard', bias: 0.6, axis: 'both' });
+  const inside = planMove(read([shifted(triangle, 700)], two), opts);
   close(inside.deltas[0].dx, 218);
   close(inside.deltas[0].dy, 100);
+  assert.deepEqual(inside.summary, { mode: 'artboard', anchor: null, movers: ['play'] });
   // Shifted 2000 right: held by no artboard, so the active one (center 300, 200) is used.
-  const outside = planMove(read([shifted(triangle, 2000)], two), { mode: 'artboard', bias: 0.6, axis: 'both' });
+  const outside = planMove(read([shifted(triangle, 2000)], two), opts);
   close(outside.deltas[0].dx, 300 - 2082);
 });
 
-test('planMove: container and key modes need a second object', () => {
-  const plan = planMove(read([triangle]), { mode: 'container', bias: 0.6, axis: 'both' });
-  assert.match(plan.error, /container/i);
+test('nothing selected: a plain-English error and no deltas', () => {
+  const plan = planMove(read([]), opts);
+  assert.match(plan.error, /select/i);
   assert.equal(plan.deltas, undefined);
 });
 
-test('planMove: a zero-area object falls back to its box center with a warning', () => {
+test('a zero-area object falls back to its box center with a warning', () => {
   const line = {
     label: 'rule', isKey: false, fingerprint: 'l', warnings: [],
     shapes: [shape([{ closed: false, polarity: 1, points: [pt(0, 0), pt(100, 0)] }])],
   };
-  const plan = planMove(read([line]), { mode: 'artboard', bias: 1, axis: 'both' });
+  const plan = planMove(read([line]), { bias: 1, axis: 'both' });
   close(plan.deltas[0].dx, 250); // box center (50, 0) to artboard center (300, 200)
   close(plan.deltas[0].dy, 200);
   assert.match(plan.warnings.join(' '), /rule.*no area/i);
 });
 
-test('planMove: crossing paths produce a warning naming the object', () => {
+test('crossing paths produce a warning naming the object', () => {
   const a = poly([[0, 0], [100, 0], [100, 100], [0, 100]]);
   const b = poly([[50, 50], [150, 50], [150, 150], [50, 150]]);
   const knot = { label: 'knot', isKey: false, fingerprint: 'k', warnings: [], shapes: [shape([a, b])] };
-  const plan = planMove(read([container, knot]), { mode: 'container', bias: 0.6, axis: 'both' });
+  const plan = planMove(read([knot, container]), opts);
   assert.match(plan.warnings.join(' '), /knot.*cross/i);
 });
 
-test("planMove: the engine's own warnings are kept, prefixed with the object", () => {
-  const noisy = { ...triangle, warnings: ['A clipping group is measured by its clip shape.'] };
-  const plan = planMove(read([container, noisy]), { mode: 'container', bias: 0.6, axis: 'both' });
-  assert.ok(plan.warnings.includes('play: A clipping group is measured by its clip shape.'));
+test("the engine's own warnings are kept, prefixed with the object", () => {
+  const noisy = { ...triangle, warnings: ['measured by its clip shape.'] };
+  const plan = planMove(read([noisy, container]), opts);
+  assert.ok(plan.warnings.includes('play: measured by its clip shape.'));
 });
 
-test('planMove: preview points are a box point per object, an optical point per mover, one target', () => {
-  const plan = planMove(read([container, triangle]), { mode: 'container', bias: 0.6, axis: 'both' });
+test('preview points: a box point per object, an optical point per mover, one target', () => {
+  const plan = planMove(read([triangle, container]), opts);
   const kinds = plan.points.map((p) => p.kind).sort();
   assert.deepEqual(kinds, ['box', 'box', 'optical', 'target']);
   const target = plan.points.find((p) => p.kind === 'target');
@@ -103,13 +117,4 @@ test('planMove: preview points are a box point per object, an optical point per 
   const optical = plan.points.find((p) => p.kind === 'optical');
   close(optical.x, 82);
   close(optical.y, 100);
-});
-
-test('planMove container: the triangle moves 18 right, the container stays', () => {
-  const plan = planMove(read([container, triangle]), { mode: 'container', bias: 0.6, axis: 'both' });
-  assert.equal(plan.error, undefined);
-  assert.deepEqual(plan.fingerprints, ['c', 't']);
-  assert.deepEqual(plan.deltas[0], { dx: 0, dy: 0 });
-  close(plan.deltas[1].dx, 18);
-  close(plan.deltas[1].dy, 0);
 });

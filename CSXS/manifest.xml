@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.jro.opticalcenter" ExtensionBundleVersion="0.1.0" ExtensionBundleName="Optical Center" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.jro.opticalcenter" ExtensionBundleVersion="0.2.0" ExtensionBundleName="Optical Center" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <ExtensionList>
-    <Extension Id="com.jro.opticalcenter.panel" Version="0.1.0"/>
+    <Extension Id="com.jro.opticalcenter.panel" Version="0.2.0"/>
   </ExtensionList>
   <ExecutionEnvironment>
     <HostList>
@@ -35,8 +35,8 @@
           <Type>Panel</Type>
           <Menu>Optical Center</Menu>
           <Geometry>
-            <Size><Height>640</Height><Width>268</Width></Size>
-            <MinSize><Height>420</Height><Width>240</Width></MinSize>
+            <Size><Height>340</Height><Width>268</Width></Size>
+            <MinSize><Height>300</Height><Width>240</Width></MinSize>
             <MaxSize><Height>1400</Height><Width>640</Width></MaxSize>
           </Geometry>
           <Icons/>

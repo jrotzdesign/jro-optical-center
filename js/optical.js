@@ -1,7 +1,11 @@
 /* Optical Center: pure geometry. Plain math coordinates; the host side converts. */
+// Loads in three hosts: Node tests (module), the CEP panel (module AND window, because of
+// --mixed-context), and ExtendScript (neither). Export to every one that exists.
 (function (root, factory) {
-  if (typeof module === 'object' && module.exports) module.exports = factory();
-  else root.Optical = factory();
+  var api = factory();
+  if (typeof module === 'object' && module && module.exports) module.exports = api;
+  if (typeof window !== 'undefined') window.Optical = api;
+  else if (root) root.Optical = api;
 })(this, function () {
   // Signed area (x2) and centroid numerators of one closed polygon (shoelace).
   function polyMoments(p) {
@@ -87,35 +91,43 @@
 
   // Subpaths are assumed nested or disjoint (no crossing). Each region is the path
   // minus its direct children, so a path contributes (filled(self) - filled(parent)).
-  function areaCentroid(shape, tol) {
-    var paths = shape.paths.map(function (p) {
-      return { points: flatten(p, tol || DEFAULT_TOLERANCE).map(function (v) { return { anchor: v }; }) };
-    }), n = paths.length;
-    var m = paths.map(function (p) {
-      var raw = polyMoments(p.points), o = raw.a2 < 0 ? -1 : 1;
+  // polys: arrays of {anchor}. For each subpath: +1 if it is the outer edge of a filled region,
+  // -1 if it is the edge of a hole, 0 if it separates two filled (or two empty) regions.
+  function regionCoefficients(polys, evenodd) {
+    var n = polys.length;
+    var m = polys.map(function (p) {
+      var raw = polyMoments(p), o = raw.a2 < 0 ? -1 : 1;
       return { a2: o * raw.a2, cx: o * raw.cx, cy: o * raw.cy, orient: o };
     });
-    var parents = paths.map(function (p, i) {
-      var probe = p.points[0].anchor, list = [];
+    var parents = polys.map(function (p, i) {
+      var probe = p[0].anchor, list = [];
       for (var j = 0; j < n; j++) {
-        if (j !== i && contains(paths[j].points, probe[0], probe[1])) list.push(j);
+        if (j !== i && contains(polys[j], probe[0], probe[1])) list.push(j);
       }
       return list;
     });
-    var filled = paths.map(function (p, i) {
-      if (shape.evenodd) return parents[i].length % 2 === 0;
+    var filled = polys.map(function (p, i) {
+      if (evenodd) return parents[i].length % 2 === 0;
       var w = m[i].orient;
       parents[i].forEach(function (j) { w += m[j].orient; });
       return w !== 0;
     });
-    var a2 = 0, cx = 0, cy = 0;
-    paths.forEach(function (p, i) {
+    return polys.map(function (p, i) {
       var parent = -1;
       parents[i].forEach(function (j) { if (parent < 0 || m[j].a2 < m[parent].a2) parent = j; });
-      var c = (filled[i] ? 1 : 0) - (parent >= 0 && filled[parent] ? 1 : 0);
-      a2 += c * m[i].a2;
-      cx += c * m[i].cx;
-      cy += c * m[i].cy;
+      return { c: (filled[i] ? 1 : 0) - (parent >= 0 && filled[parent] ? 1 : 0), m: m[i] };
+    });
+  }
+
+  function areaCentroid(shape, tol) {
+    var paths = shape.paths.map(function (p) {
+      return { points: flatten(p, tol || DEFAULT_TOLERANCE).map(function (v) { return { anchor: v }; }) };
+    });
+    var a2 = 0, cx = 0, cy = 0;
+    regionCoefficients(paths.map(function (p) { return p.points; }), shape.evenodd).forEach(function (r) {
+      a2 += r.c * r.m.a2;
+      cx += r.c * r.m.cx;
+      cy += r.c * r.m.cy;
     });
     return {
       x: cx / (3 * a2),
@@ -165,10 +177,11 @@
 
   // opts: { mode: 'container'|'key'|'artboard', items: [{bbox, centroid}] topmost first,
   // keyIndex?, artboard?, bias (0..1), axis: 'both'|'h'|'v' }. Returns [{dx, dy}] per item.
+  // The container is the back-most item (the last one); a missing key falls back to it.
   function moveDelta(opts) {
-    var items = opts.items, axis = opts.axis, anchor = -1, target;
-    if (opts.mode === 'container') anchor = 0;
-    else if (opts.mode === 'key') anchor = opts.keyIndex >= 0 && opts.keyIndex < items.length ? opts.keyIndex : 0;
+    var items = opts.items, axis = opts.axis, anchor = -1, target, back = items.length - 1;
+    if (opts.mode === 'container') anchor = back;
+    else if (opts.mode === 'key') anchor = opts.keyIndex >= 0 && opts.keyIndex < items.length ? opts.keyIndex : back;
 
     if (anchor >= 0) target = opticalPoint(items[anchor].bbox, items[anchor].centroid, opts.bias, 'both');
     else target = { x: (opts.artboard.minX + opts.artboard.maxX) / 2, y: (opts.artboard.minY + opts.artboard.maxY) / 2 };
@@ -192,15 +205,17 @@
     return { minX: pick[0], minY: pick[3], maxX: pick[2], maxY: pick[1] };
   }
 
+  // The mode comes from the selection: one object centers on its artboard; with two or more,
+  // a keyed object stays put if there is one, otherwise the back-most object is the container.
   function planMove(read, opts) {
-    var mode = opts.mode, n = read.items.length, warnings = [], points = [], keyIndex = -1, deltas, targets = {};
-    if (n < 1) return { error: 'Select at least one object.' };
-    if (mode === 'container' && n < 2) return { error: 'Select the container and at least one more object.' };
-    if (mode === 'key' && n < 2) return { error: 'Select the key object and at least one more object.' };
+    var n = read.items.length, warnings = [], points = [], keyIndex = -1, deltas, targets = {}, mode;
+    if (n < 1) return { error: 'Select a shape first.' };
+    read.items.forEach(function (it, i) { if (it.isKey) keyIndex = i; });
+    mode = n === 1 ? 'artboard' : (keyIndex >= 0 ? 'key' : 'container');
 
-    var measured = read.items.map(function (it, i) {
-      var bb = bounds(it.shapes), g = groupCentroid(it.shapes);
-      if (it.isKey) keyIndex = i;
+    var measured = read.items.map(function (it) {
+      var own = [], shapes = itemShapes(it, own), bb = bounds(shapes), g = groupCentroid(shapes);
+      own.forEach(function (w) { warnings.push(it.label + ': ' + w); });
       if (!isFinite(g.x) || !isFinite(g.y) || !(g.area > 1e-9)) {
         g = { x: (bb.minX + bb.maxX) / 2, y: (bb.minY + bb.maxY) / 2, crossing: false };
         warnings.push(it.label + ' has no area, so its box center was used.');
@@ -211,8 +226,7 @@
       return { bbox: bb, centroid: { x: g.x, y: g.y } };
     });
 
-    if (mode === 'key' && keyIndex < 0) warnings.push('No key is set, so the topmost object is the key.');
-    var anchor = mode === 'container' ? 0 : (mode === 'key' ? Math.max(keyIndex, 0) : -1);
+    var anchor = mode === 'container' ? n - 1 : (mode === 'key' ? keyIndex : -1);
 
     if (mode === 'artboard') {
       deltas = measured.map(function (m) {
@@ -234,13 +248,163 @@
     return {
       deltas: deltas,
       fingerprints: read.items.map(function (it) { return it.fingerprint; }),
+      labels: read.items.map(function (it) { return it.label; }),
       warnings: warnings,
-      points: points
+      points: points,
+      summary: {
+        mode: mode,
+        anchor: anchor >= 0 ? read.items[anchor].label : null,
+        movers: read.items.filter(function (it, i) { return i !== anchor; }).map(function (it) { return it.label; })
+      }
     };
+  }
+
+  // An item arrives either as ready shapes (tests) or as the engine's pieces (fill and stroke).
+  function itemShapes(item, warnings) {
+    return item.shapes || piecesToShapes(item.pieces || [], warnings);
+  }
+
+  // ---------- strokes as offset bands ----------
+  // A stroke of width w covers the band within w/2 of its path, so its mass is computed from the
+  // path's offsets instead of outlining it in Illustrator. Joins: miter (with limit), round, bevel.
+  // Caps: butt, round, projecting. Dashes, stroke alignment and variable widths are not modelled.
+
+  function unit(v) { var l = Math.sqrt(v[0] * v[0] + v[1] * v[1]); return l ? [v[0] / l, v[1] / l] : [0, 0]; }
+  function leftNormal(d) { return [-d[1], d[0]]; }
+  function addScaled(p, v, s) { return [p[0] + v[0] * s, p[1] + v[1] * s]; }
+
+  // Points on an arc around c, radius r, from angle a0 sweeping by `sweep`, endpoints excluded.
+  // Arcs use a tenth of the curve tolerance: on small radii (thin strokes) the inscribed polygon
+  // otherwise loses about 1% of a round cap's area.
+  function arcPoints(c, r, a0, sweep, tol, out) {
+    var step = 2 * Math.acos(Math.max(-1, 1 - tol / 10 / r)), n = Math.max(2, Math.ceil(Math.abs(sweep) / step));
+    for (var k = 1; k < n; k++) {
+      var a = a0 + sweep * k / n;
+      out.push([c[0] + r * Math.cos(a), c[1] + r * Math.sin(a)]);
+    }
+  }
+
+  function dedupe(pts, closed) {
+    var out = [];
+    pts.forEach(function (p) {
+      var q = out[out.length - 1];
+      if (!q || Math.abs(q[0] - p[0]) > 1e-9 || Math.abs(q[1] - p[1]) > 1e-9) out.push(p);
+    });
+    if (closed && out.length > 1) {
+      var f = out[0], l = out[out.length - 1];
+      if (Math.abs(f[0] - l[0]) < 1e-9 && Math.abs(f[1] - l[1]) < 1e-9) out.pop();
+    }
+    return out;
+  }
+
+  // One side of a polyline offset by d (d > 0 is to the left of travel), with joins.
+  function offsetSide(pts, d, closed, style, tol) {
+    var n = pts.length, dirs = [], out = [], i, segs = closed ? n : n - 1;
+    for (i = 0; i < segs; i++) dirs.push(unit([pts[(i + 1) % n][0] - pts[i][0], pts[(i + 1) % n][1] - pts[i][1]]));
+    for (i = 0; i < n; i++) {
+      if (!closed && i === 0) { out.push(addScaled(pts[0], leftNormal(dirs[0]), d)); continue; }
+      if (!closed && i === n - 1) { out.push(addScaled(pts[i], leftNormal(dirs[segs - 1]), d)); continue; }
+      joinPoints(pts[i], dirs[(i - 1 + segs) % segs], dirs[i % segs], d, style, tol, out);
+    }
+    return out;
+  }
+
+  function joinPoints(p, a, b, d, style, tol, out) {
+    var na = leftNormal(a), nb = leftNormal(b), cross = a[0] * b[1] - a[1] * b[0], cosA = na[0] * nb[0] + na[1] * nb[1];
+    if (Math.abs(cross) < 1e-12 && cosA > 0) { out.push(addScaled(p, na, d)); return; }
+    var outer = cross * d < 0;
+    if (!outer && cosA > -0.999) {
+      out.push([p[0] + (na[0] + nb[0]) * d / (1 + cosA), p[1] + (na[1] + nb[1]) * d / (1 + cosA)]);
+      return;
+    }
+    var pa = addScaled(p, na, d), pb = addScaled(p, nb, d);
+    if (outer && style.join === 'miter' && cosA > -0.999) {
+      var ratio = 1 / Math.sqrt((1 + cosA) / 2);
+      if (ratio <= (style.miterLimit || 10)) {
+        out.push([p[0] + (na[0] + nb[0]) * d / (1 + cosA), p[1] + (na[1] + nb[1]) * d / (1 + cosA)]);
+        return;
+      }
+    }
+    out.push(pa);
+    if (outer && style.join === 'round') {
+      var ua = d > 0 ? na : [-na[0], -na[1]], ub = d > 0 ? nb : [-nb[0], -nb[1]];
+      arcPoints(p, Math.abs(d), Math.atan2(ua[1], ua[0]), Math.atan2(ua[0] * ub[1] - ua[1] * ub[0], ua[0] * ub[0] + ua[1] * ub[1]), tol, out);
+    }
+    out.push(pb);
+  }
+
+  function signedArea(pts) {
+    var a = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i], q = pts[(i + 1) % pts.length];
+      a += p[0] * q[1] - q[0] * p[1];
+    }
+    return a / 2;
+  }
+
+  // Grows a closed polygon by h (shrinks if h < 0), whichever way it is wound.
+  function grow(pts, h, style, tol) {
+    return offsetSide(pts, signedArea(pts) > 0 ? -h : h, true, style, tol);
+  }
+
+  // The closed outline of an open path's stroke: left side, end cap, right side back, start cap.
+  function openBand(pts, h, style, tol) {
+    pts = pts.slice();
+    var n = pts.length, s = unit([pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]]);
+    var e = unit([pts[n - 1][0] - pts[n - 2][0], pts[n - 1][1] - pts[n - 2][1]]);
+    if (style.cap === 'projecting') {
+      pts[0] = addScaled(pts[0], s, -h);
+      pts[n - 1] = addScaled(pts[n - 1], e, h);
+    }
+    var left = offsetSide(pts, h, false, style, tol), right = offsetSide(pts, -h, false, style, tol).reverse(), out = left.slice();
+    if (style.cap === 'round') { var ne = leftNormal(e); arcPoints(pts[n - 1], h, Math.atan2(ne[1], ne[0]), -Math.PI, tol, out); }
+    out = out.concat(right);
+    if (style.cap === 'round') { var ns = leftNormal(s); arcPoints(pts[0], h, Math.atan2(-ns[1], -ns[0]), -Math.PI, tol, out); }
+    return out;
+  }
+
+  function toPath(verts) {
+    return { closed: true, polarity: 1, points: verts.map(function (v) { return { anchor: v, left: v, right: v }; }) };
+  }
+
+  // Engine pieces (fill flag, stroke style, paths) to plain shapes. Warnings go into `warnings`.
+  function piecesToShapes(pieces, warnings) {
+    var out = [], tol = DEFAULT_TOLERANCE;
+    pieces.forEach(function (pc) {
+      var st = pc.stroke && pc.stroke.width > 0 ? pc.stroke : null;
+      if (!st) { if (pc.fill) out.push({ evenodd: pc.evenodd, paths: pc.paths }); return; }
+      var h = st.width / 2;
+      var flat = pc.paths.map(function (p) { return { closed: p.closed, pts: dedupe(flatten(p, tol), p.closed) }; })
+        .filter(function (f) { return f.pts.length >= 2; });
+      var allClosed = flat.every(function (f) { return f.closed && f.pts.length >= 3; });
+
+      if (pc.fill && allClosed) {
+        // Fill plus a centered stroke: every edge moves outward from the fill by half the stroke.
+        var roles = regionCoefficients(flat.map(function (f) { return f.pts.map(function (v) { return { anchor: v }; }); }), pc.evenodd);
+        out.push({
+          evenodd: pc.evenodd,
+          paths: flat.map(function (f, i) { return toPath(roles[i].c === 0 ? f.pts : grow(f.pts, roles[i].c * h, st, tol)); })
+        });
+        return;
+      }
+      if (pc.fill) {
+        out.push({ evenodd: pc.evenodd, paths: pc.paths });
+        if (warnings) warnings.push('An open path with both fill and stroke counts their overlap twice.');
+      }
+      flat.forEach(function (f) {
+        if (f.closed && f.pts.length >= 3) {
+          out.push({ evenodd: true, paths: [toPath(grow(f.pts, h, st, tol)), toPath(grow(f.pts, -h, st, tol))] });
+        } else {
+          out.push({ evenodd: false, paths: [toPath(openBand(f.pts, h, st, tol))] });
+        }
+      });
+    });
+    return out;
   }
 
   return {
     planMove: planMove,
+    piecesToShapes: piecesToShapes,
     areaCentroid: areaCentroid,
     groupCentroid: groupCentroid,
     flatten: flatten,

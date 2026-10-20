@@ -1,10 +1,12 @@
 /* Optical Center: ExtendScript engine.
    Every entry point returns a JSON string: {ok:true, ...} or {ok:false, error}.
-   The user's document is never touched except by OC_move and the marker layer.
-   Strokes are expanded on copies inside a scratch document that is always closed unsaved. */
+   Geometry is read straight from the live document: reading changes nothing and adds no undo
+   steps. Strokes are sent as their style (width, join, cap) and turned into mass by optical.js.
+   Live text is the one exception: it is outlined on a copy in a scratch document that is opened
+   and closed within the same call. Only OC_move and the marker layer change the document. */
 
 var OC_MARKER_LAYER = "__optical_center_markers__";
-var OC_MAX_DEPTH = 8;
+var OC_MAX_DEPTH = 12;
 
 // ---------- plumbing ----------
 
@@ -31,6 +33,7 @@ function OC_parse(s) {
 }
 
 // Alert suppression and the document coordinate system (y up) wrap every call.
+// Errors carry a code the panel turns into plain English.
 function OC_run(fn) {
   var oldLevel = app.userInteractionLevel, oldCS = app.coordinateSystem, res;
   try {
@@ -40,15 +43,21 @@ function OC_run(fn) {
     if (!res) res = {};
     res.ok = true;
   } catch (e) {
-    res = { ok: false, error: String(e.message || e) };
+    res = { ok: false, code: e.ocCode || "internal", error: String(e.message || e) };
   }
   try { app.coordinateSystem = oldCS; } catch (e2) {}
   try { app.userInteractionLevel = oldLevel; } catch (e3) {}
   return OC_json(res);
 }
 
+function OC_fail(code, message) {
+  var e = new Error(message);
+  e.ocCode = code;
+  throw e;
+}
+
 function OC_doc() {
-  if (app.documents.length === 0) throw new Error("Open a document first.");
+  if (app.documents.length === 0) OC_fail("no-document", "No document is open.");
   return app.activeDocument;
 }
 
@@ -104,7 +113,64 @@ function OC_fingerprint(item) {
   return item.geometricBounds.join(",");
 }
 
-// ---------- geometry extraction (runs on scratch copies only) ----------
+// ---------- plain names for the live line ----------
+
+function OC_near(a, b, tol) { return Math.abs(a - b) <= tol; }
+
+function OC_isCorner(p) {
+  return OC_near(p.anchor[0], p.leftDirection[0], 1e-6) && OC_near(p.anchor[1], p.leftDirection[1], 1e-6) &&
+         OC_near(p.anchor[0], p.rightDirection[0], 1e-6) && OC_near(p.anchor[1], p.rightDirection[1], 1e-6);
+}
+
+function OC_pathKind(p) {
+  var pts = p.pathPoints, n = pts.length, i, corners = 0, b = p.geometricBounds, w = b[2] - b[0], h = b[1] - b[3];
+  var square = OC_near(w, h, Math.max(w, h) * 0.02);
+  if (!p.closed) return "line";
+  for (i = 0; i < n; i++) if (OC_isCorner(pts[i])) corners++;
+  if (corners === n) {
+    if (n === 3) return "triangle";
+    if (n === 4) {
+      var axis = true;
+      for (i = 0; i < 4; i++) {
+        var a = pts[i].anchor, c = pts[(i + 1) % 4].anchor;
+        if (!OC_near(a[0], c[0], 1e-6) && !OC_near(a[1], c[1], 1e-6)) axis = false;
+      }
+      if (axis) return square ? "square" : "rectangle";
+    }
+    if (n >= 10 && n % 2 === 0) return "star";
+    return "shape";
+  }
+  if (corners === 0 && n === 4) return square ? "circle" : "ellipse";
+  return "shape";
+}
+
+// "the triangle", "the text “J”", or the layer name the user gave it.
+function OC_describe(item) {
+  var t = item.typename, s;
+  if (item.name) return item.name;
+  if (t === "TextFrame") {
+    s = String(item.contents).replace(/[\r\n]+/g, " ");
+    return "the text “" + (s.length > 14 ? s.slice(0, 13) + "…" : s) + "”";
+  }
+  if (t === "PathItem") return "the " + OC_pathKind(item);
+  if (t === "CompoundPathItem") return "the compound shape";
+  if (t === "GroupItem") return item.clipped ? "the clipping group" : "the group";
+  if (t === "PlacedItem" || t === "RasterItem") return "the image";
+  if (t === "SymbolItem") return "the symbol";
+  return "the object";
+}
+
+function OC_hasText(item, depth) {
+  var i;
+  if (depth > 4) return false;
+  if (item.typename === "TextFrame") return true;
+  if (item.typename === "GroupItem") {
+    for (i = 0; i < item.pageItems.length && i < 200; i++) if (OC_hasText(item.pageItems[i], depth + 1)) return true;
+  }
+  return false;
+}
+
+// ---------- geometry extraction (read-only) ----------
 
 function OC_pathData(p, st) {
   var pts = [], pp = p.pathPoints, i, q;
@@ -126,17 +192,32 @@ function OC_pathsOf(item) {
   return list;
 }
 
-function OC_pushShape(item, st) {
-  var list = OC_pathsOf(item), paths = [], i, evenodd = false;
-  for (i = 0; i < list.length; i++) paths.push(OC_pathData(list[i], st));
-  try { evenodd = list[0].evenodd; } catch (e) {}
-  st.shapes.push({ evenodd: evenodd, paths: paths });
+function OC_strokeStyle(p) {
+  var join = String(p.strokeJoin), cap = String(p.strokeCap);
+  return {
+    width: p.strokeWidth,
+    join: join.indexOf("ROUND") >= 0 ? "round" : (join.indexOf("BEVEL") >= 0 ? "bevel" : "miter"),
+    cap: cap.indexOf("ROUND") >= 0 ? "round" : (cap.indexOf("PROJECTING") >= 0 ? "projecting" : "butt"),
+    miterLimit: p.strokeMiterLimit
+  };
 }
 
-function OC_pushBoxShape(item, st, why) {
+function OC_pushPiece(item, st, forceFillOnly) {
+  var list = OC_pathsOf(item), first = list[0], paths = [], i, evenodd = false, filled, stroked;
+  if (!first || first.guides) return;
+  filled = forceFillOnly ? true : first.filled;
+  stroked = !forceFillOnly && first.stroked && first.strokeWidth > 0;
+  if (!filled && !stroked) { st.warnings.push("An object with no fill or stroke was skipped."); return; }
+  for (i = 0; i < list.length; i++) paths.push(OC_pathData(list[i], st));
+  try { evenodd = first.evenodd; } catch (e) {}
+  try { if (stroked && first.strokeDashes && first.strokeDashes.length) st.warnings.push("Dashed strokes are measured as solid."); } catch (e2) {}
+  st.pieces.push({ fill: filled, stroke: stroked ? OC_strokeStyle(first) : null, evenodd: evenodd, paths: paths });
+}
+
+function OC_pushBoxPiece(item, st, why) {
   var b = item.geometricBounds, x0 = b[0] + st.dx, y0 = b[1] + st.dy, x1 = b[2] + st.dx, y1 = b[3] + st.dy;
   function pt(x, y) { return { anchor: [x, y], left: [x, y], right: [x, y] }; }
-  st.shapes.push({ evenodd: false, paths: [{ closed: true, polarity: 1, points: [pt(x0, y0), pt(x1, y0), pt(x1, y1), pt(x0, y1)] }] });
+  st.pieces.push({ fill: true, stroke: null, evenodd: false, paths: [{ closed: true, polarity: 1, points: [pt(x0, y0), pt(x1, y0), pt(x1, y1), pt(x0, y1)] }] });
   st.warnings.push(why);
 }
 
@@ -148,104 +229,64 @@ function OC_isClipPath(it) {
   return false;
 }
 
-// Object > Path > Outline Stroke on the scratch copy; returns what the selection became.
-function OC_outline(item, st) {
-  st.doc.selection = null;
-  item.selected = true;
-  app.executeMenuCommand("OffsetPath v22");
-  var res = [], sel = st.doc.selection, i;
-  for (i = 0; i < sel.length; i++) res.push(sel[i]);
-  return res;
-}
-
-function OC_setFilled(item, value) {
-  var list = OC_pathsOf(item), i;
-  for (i = 0; i < list.length; i++) list[i].filled = value;
-}
-
-function OC_area(it) {
-  var b = it.geometricBounds;
-  return Math.abs((b[2] - b[0]) * (b[1] - b[3]));
-}
-
-function OC_collectPaths(item, st, depth) {
-  var first = OC_pathsOf(item)[0], filled, stroked, simple, ring, i, best, leaves;
-  if (!first) return;
-  if (first.guides) return;
-  filled = first.filled;
-  stroked = first.stroked && first.strokeWidth > 0;
-  if (!filled && !stroked) { st.warnings.push("Skipped an object with no fill or stroke."); return; }
-  if (!stroked) { OC_pushShape(item, st); return; }
-
-  simple = item.typename === "PathItem" && item.closed;
-  if (filled && !simple) {
-    OC_pushShape(item, st);
-    st.warnings.push("A filled and stroked compound shape counts its stroke overlap twice.");
-  }
-  if (filled) OC_setFilled(item, false);
-  ring = OC_outline(item, st);
-
-  if (filled && simple) {
-    // fill + centered stroke = the region inside the stroke's outer contour
-    leaves = [];
-    for (i = 0; i < ring.length; i++) OC_leaves(ring[i], leaves);
-    best = null;
-    for (i = 0; i < leaves.length; i++) if (!best || OC_area(leaves[i]) > OC_area(best)) best = leaves[i];
-    if (best) {
-      st.shapes.push({ evenodd: false, paths: [OC_pathData(best, st)] });
-      return;
-    }
-  }
-  for (i = 0; i < ring.length; i++) OC_collect(ring[i], st, depth + 1);
-}
-
-function OC_leaves(item, out) {
-  var t = item.typename, i, kids = [];
-  if (t === "PathItem") out.push(item);
-  else if (t === "CompoundPathItem") for (i = 0; i < item.pathItems.length; i++) out.push(item.pathItems[i]);
-  else if (t === "GroupItem") {
-    for (i = 0; i < item.pageItems.length; i++) kids.push(item.pageItems[i]);
-    for (i = 0; i < kids.length; i++) OC_leaves(kids[i], out);
-  }
-}
-
+// Walks an item. Text frames are not read here; they are queued in st.texts for outlining.
 function OC_collect(item, st, depth) {
-  var t = item.typename, kids = [], i, g;
+  var t = item.typename, i;
   if (depth > OC_MAX_DEPTH) return;
   try { if (item.hidden) return; } catch (e) {}
 
   if (t === "GroupItem") {
     if (item.clipped) {
       for (i = 0; i < item.pageItems.length; i++) {
-        if (OC_isClipPath(item.pageItems[i])) { OC_pushShape(item.pageItems[i], st); break; }
+        if (OC_isClipPath(item.pageItems[i])) { OC_pushPiece(item.pageItems[i], st, true); break; }
       }
-      st.warnings.push("A clipping group is measured by its clip shape, not the clipped artwork.");
+      st.warnings.push("A clipping group is measured by its clipping shape.");
       return;
     }
-    for (i = 0; i < item.pageItems.length; i++) kids.push(item.pageItems[i]);
-    for (i = 0; i < kids.length; i++) OC_collect(kids[i], st, depth + 1);
+    for (i = 0; i < item.pageItems.length; i++) OC_collect(item.pageItems[i], st, depth + 1);
     return;
   }
-  if (t === "TextFrame") {
-    try { g = item.createOutline(); } catch (e2) { g = null; }
-    if (g) OC_collect(g, st, depth + 1);
-    else OC_pushBoxShape(item, st, "Text could not be outlined, so its box was used.");
-    return;
-  }
-  if (t === "PathItem" || t === "CompoundPathItem") { OC_collectPaths(item, st, depth); return; }
-  OC_pushBoxShape(item, st, "A " + t + " was measured by its bounding box.");
+  if (t === "TextFrame") { st.texts.push(item); return; }
+  if (t === "PathItem" || t === "CompoundPathItem") { OC_pushPiece(item, st, false); return; }
+  OC_pushBoxPiece(item, st, OC_describe(item).replace(/^the /, "The ") + " is measured by its bounding box.");
 }
 
-// Copies an item into the scratch document. duplicate() sometimes returns undefined across
-// documents, so the copy is found at the back of the scratch layer when the return value is empty.
+// Copies an item into the scratch document. duplicate() returns undefined when the original is
+// selected, so callers deselect first; the copy is also looked up at the back of the layer.
 function OC_copyTo(item, scratch) {
   var copy = item.duplicate(scratch, ElementPlacement.PLACEATEND), list;
   if (!copy) {
     list = scratch.layers[0].pageItems;
     copy = list[list.length - 1];
   }
-  if (!copy || copy.typename !== item.typename) throw new Error("Could not copy " + (item.name || item.typename) + " for measuring.");
+  if (!copy || copy.typename !== item.typename) OC_fail("copy-failed", "Could not copy " + OC_describe(item) + " for measuring.");
   return copy;
+}
+
+// Outlines queued text frames on copies in one scratch document, then closes it unsaved.
+function OC_readTexts(doc, entries, list) {
+  var scratch = null, i, j;
+  try {
+    doc.selection = null;
+    scratch = app.documents.add(DocumentColorSpace.RGB, 200, 200);
+    for (i = 0; i < entries.length; i++) {
+      var st = entries[i].st;
+      for (j = 0; j < st.texts.length; j++) {
+        var tf = st.texts[j], gb = tf.geometricBounds, copy = OC_copyTo(tf, scratch), cb = copy.geometricBounds, g = null;
+        try { g = copy.createOutline(); } catch (e) { g = null; }
+        var sub = { dx: gb[0] - cb[0], dy: gb[1] - cb[1], pieces: st.pieces, warnings: st.warnings, texts: [] };
+        if (g) OC_collect(g, sub, 0);
+        else { sub.dx = 0; sub.dy = 0; OC_pushBoxPiece(tf, sub, "Text could not be outlined, so its box was used."); }
+      }
+    }
+  } finally {
+    if (scratch) { try { scratch.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {} }
+    try { app.activeDocument = doc; } catch (e3) {}
+    try {
+      doc.selection = null;
+      for (i = 0; i < list.length; i++) list[i].item.selected = true;
+    } catch (e4) {}
+  }
 }
 
 // ---------- entry points ----------
@@ -254,51 +295,71 @@ function OC_ping() {
   return OC_run(function () { return { version: app.version, docs: app.documents.length }; });
 }
 
+// Cheap description of the selection for the panel's live line. Cached by selection signature,
+// so polling it costs one pass over the selected items when nothing has changed.
+function OC_peek(keyUuid, keyDoc) {
+  return OC_run(function () {
+    if (app.documents.length === 0) return { doc: null, count: 0, labels: [], hasText: false, keyInSelection: false };
+    var doc = app.activeDocument, sel = doc.selection, sig = doc.name, i, n;
+    if (!sel || sel.typename === "TextRange") return { doc: doc.name, count: 0, labels: [], hasText: false, keyInSelection: false, editingText: !!sel };
+    n = sel.length;
+    for (i = 0; i < n && i < 400; i++) sig += "|" + sel[i].uuid + ":" + sel[i].geometricBounds.join(",");
+    // A restack keeps every bound the same, so the cache also expires every 3 seconds.
+    sig += "|" + keyUuid + "|" + Math.floor(new Date().getTime() / 3000);
+    if ($.global.OC_peekCache && $.global.OC_peekCache.sig === sig) return $.global.OC_peekCache.res;
+
+    var res = { doc: doc.name, count: n, labels: [], hasText: false, keyInSelection: false };
+    if (n <= 40) {
+      var list = OC_selectionSorted(doc);
+      for (i = 0; i < list.length; i++) {
+        res.labels.push(OC_describe(list[i].item));
+        if (OC_hasText(list[i].item, 0)) res.hasText = true;
+        if (keyUuid && String(list[i].item.uuid) === String(keyUuid) && doc.name === keyDoc) res.keyInSelection = true;
+      }
+    }
+    $.global.OC_peekCache = { sig: sig, res: res };
+    return res;
+  });
+}
+
 // The selected item's uuid, for the panel to hold as the key for this session.
 function OC_peekKey() {
   return OC_run(function () {
     var doc = OC_doc(), sel = doc.selection;
-    if (!sel || sel.length !== 1) throw new Error("Select exactly one object to set as the key.");
-    return { uuid: sel[0].uuid, doc: doc.name, label: sel[0].name || sel[0].typename };
+    if (!sel || sel.typename === "TextRange" || sel.length !== 1) OC_fail("key-needs-one", "Select exactly one object to set as the key.");
+    return { uuid: sel[0].uuid, doc: doc.name, label: OC_describe(sel[0]) };
   });
 }
 
-// Reads the selection (topmost first) as flattenable shapes. Works on copies in a scratch doc.
+// Reads the selection (topmost first) as pieces: fill flag, stroke style, bezier paths.
 function OC_read(keyUuid, keyDoc) {
   return OC_run(function () {
-    var doc = OC_doc(), list = OC_selectionSorted(doc), items = [], boards = [], i, scratch = null;
-    if (!list.length) throw new Error("Select at least one object.");
+    var doc = OC_doc(), list = OC_selectionSorted(doc), entries = [], boards = [], i, withText = false;
+    if (!list.length) OC_fail("no-selection", "Nothing is selected.");
 
     for (i = 0; i < doc.artboards.length; i++) boards.push(doc.artboards[i].artboardRect);
     var activeBoard = doc.artboards.getActiveArtboardIndex();
 
-    try {
-      // Originals are deselected while we work. A selected item duplicates to another document as
-      // undefined, and with nothing selected here a stray menu command has nothing of yours to hit.
-      doc.selection = null;
-      scratch = app.documents.add(DocumentColorSpace.RGB, 200, 200);
-      for (i = 0; i < list.length; i++) {
-        var it = list[i].item, gb = it.geometricBounds, copy = OC_copyTo(it, scratch);
-        var cb = copy.geometricBounds;
-        var st = { doc: scratch, dx: gb[0] - cb[0], dy: gb[1] - cb[1], shapes: [], warnings: [] };
-        OC_collect(copy, st, 0);
-        items.push({
-          label: it.name || it.typename,
-          isKey: keyUuid !== undefined && keyUuid !== "" && String(it.uuid) === String(keyUuid) && doc.name === keyDoc,
-          fingerprint: OC_fingerprint(it),
-          shapes: st.shapes,
-          warnings: st.warnings
-        });
-      }
-    } finally {
-      if (scratch) { try { scratch.close(SaveOptions.DONOTSAVECHANGES); } catch (e) {} }
-      try { app.activeDocument = doc; } catch (e2) {}
-      try {
-        doc.selection = null;
-        for (i = 0; i < list.length; i++) list[i].item.selected = true;
-      } catch (e3) {}
+    for (i = 0; i < list.length; i++) {
+      var st = { dx: 0, dy: 0, pieces: [], warnings: [], texts: [] };
+      OC_collect(list[i].item, st, 0);
+      if (st.texts.length) withText = true;
+      entries.push({ item: list[i].item, st: st });
     }
-    return { doc: doc.name, items: items, artboards: boards, activeArtboard: activeBoard };
+    if (withText) OC_readTexts(doc, entries, list);
+
+    var items = [];
+    for (i = 0; i < entries.length; i++) {
+      var it = entries[i].item;
+      items.push({
+        label: OC_describe(it),
+        isKey: !!keyUuid && String(it.uuid) === String(keyUuid) && doc.name === keyDoc,
+        fingerprint: OC_fingerprint(it),
+        pieces: entries[i].st.pieces,
+        warnings: entries[i].st.warnings
+      });
+    }
+    return { doc: doc.name, items: items, artboards: boards, activeArtboard: activeBoard, usedScratch: withText };
   });
 }
 
@@ -327,11 +388,7 @@ function OC_clearMarkers() {
 function OC_preview(payload) {
   return OC_run(function () {
     var doc = OC_doc(), data = OC_parse(payload), prev = doc.activeLayer, layer, i, p, arm, c;
-    var colors = {
-      box: OC_rgb(228, 0, 124),
-      optical: OC_rgb(41, 161, 145),
-      target: OC_rgb(41, 161, 145)
-    };
+    var colors = { box: OC_rgb(228, 0, 124), optical: OC_rgb(41, 161, 145), target: OC_rgb(41, 161, 145) };
     while (OC_markerLayer(doc)) { var old = OC_markerLayer(doc); old.locked = false; old.remove(); }
     layer = doc.layers.add();
     layer.name = OC_MARKER_LAYER;
@@ -366,9 +423,9 @@ function OC_line(layer, pts, color) {
 function OC_move(payload) {
   return OC_run(function () {
     var doc = OC_doc(), data = OC_parse(payload), list = OC_selectionSorted(doc), i, d, moved = 0;
-    if (list.length !== data.deltas.length) throw new Error("The selection changed. Run it again.");
+    if (list.length !== data.deltas.length) OC_fail("selection-changed", "The selection changed.");
     for (i = 0; i < list.length; i++) {
-      if (OC_fingerprint(list[i].item) !== data.fingerprints[i]) throw new Error("The selection changed. Run it again.");
+      if (OC_fingerprint(list[i].item) !== data.fingerprints[i]) OC_fail("selection-changed", "The selection changed.");
     }
     for (i = 0; i < list.length; i++) {
       d = data.deltas[i];
