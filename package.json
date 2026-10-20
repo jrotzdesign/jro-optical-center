@@ -4,6 +4,6 @@
   "private": true,
   "description": "Illustrator CEP panel that aligns objects by visual mass instead of bounding box.",
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   }
 }
