@@ -14,6 +14,10 @@ const shape = (paths, evenodd = false) => ({ evenodd, paths });
 const close = (actual, expected, eps = 1e-6) =>
   assert.ok(Math.abs(actual - expected) < eps, `${actual} is not within ${eps} of ${expected}`);
 
+// Hand arithmetic for the 100x100 outer with a 20x30 hole at x 60-80, y 20-50:
+//   area   = 10000 - 20*30 = 9400
+//   x      = (50*10000 - 70*600) / 9400 = (500000 - 42000) / 9400 = 458000 / 9400
+//   y      = (50*10000 - 35*600) / 9400 = (500000 - 21000) / 9400 = 479000 / 9400
 test('even-odd hole with the SAME winding as the outer is still subtracted', () => {
   const outer = poly([[0, 0], [100, 0], [100, 100], [0, 100]]);
   const hole = poly([[60, 20], [80, 20], [80, 50], [60, 50]]); // same CCW winding
@@ -41,6 +45,8 @@ test('non-zero: inner subpath with the OPPOSITE winding is a hole', () => {
   close(y, 479000 / 9400);
 });
 
+// x -100..-20 is 80 wide, y -50..30 is 80 tall: area 80*80 = 6400,
+// center x = (-100 + -20) / 2 = -60, center y = (-50 + 30) / 2 = -10.
 test('negative coordinates: centroid is still the geometric center', () => {
   const sq = shape([poly([[-100, -50], [-20, -50], [-20, 30], [-100, 30]])]);
   const { x, y, area } = areaCentroid(sq);
@@ -49,6 +55,8 @@ test('negative coordinates: centroid is still the geometric center', () => {
   close(y, -10);
 });
 
+// Two 100x100 squares, centers x=50 and x=100, y=50 for both:
+//   area = 10000 + 10000 = 20000, x = (50*10000 + 100*10000) / 20000 = 75, y = 50.
 test('group: areas are summed and overlaps count twice (known limit)', () => {
   const a = shape([poly([[0, 0], [100, 0], [100, 100], [0, 100]])]);
   const b = shape([poly([[50, 0], [150, 0], [150, 100], [50, 100]])]);
@@ -88,7 +96,9 @@ test('flatten: a looser tolerance yields fewer vertices', () => {
   assert.ok(loose >= 8, 'still more than the four anchors');
 });
 
-// Right-pointing play triangle: bbox center (40, 50), area centroid (80/3, 50).
+// Right-pointing play triangle (0,0) (0,100) (80,50):
+//   bbox center = (80/2, 100/2) = (40, 50); centroid = ((0+0+80)/3, (0+100+50)/3) = (80/3, 50).
+//   bias 0.6 on x: 40 + 0.6 * (80/3 - 40) = 40 + 0.6 * (-40/3) = 40 - 8 = 32.
 const playBBox = { minX: 0, minY: 0, maxX: 80, maxY: 100 };
 const playCentroid = { x: 80 / 3, y: 50 };
 
@@ -113,6 +123,11 @@ test('opticalPoint: an excluded axis comes back null', () => {
 });
 
 // Circle container (top of the z-order) with a play triangle inside it.
+// Triangle (50,50) (50,150) (130,100): bbox center = (90, 100), centroid = (230/3, 100).
+//   optical x at bias 0.6 = 90 + 0.6 * (230/3 - 90) = 90 + 0.6 * (-40/3) = 90 - 8 = 82.
+//   Circle optical point = (100, 100). Container mode: dx = 100 - 82 = 18, dy = 100 - 100 = 0.
+//   Key mode on the triangle: the circle moves dx = 82 - 100 = -18.
+//   Artboard center (200, 200): dx = 200 - 82 = 118, dy = 200 - 100 = 100.
 const circle = { bbox: { minX: 0, minY: 0, maxX: 200, maxY: 200 }, centroid: { x: 100, y: 100 } };
 const triangle = { bbox: { minX: 50, minY: 50, maxX: 130, maxY: 150 }, centroid: { x: 230 / 3, y: 100 } };
 const artboard = { minX: 0, minY: 0, maxX: 400, maxY: 400 };
@@ -150,6 +165,31 @@ test('moveDelta: H only and V only zero the other axis', () => {
   assert.equal(h[0].dy, 0);
   assert.equal(v[0].dx, 0);
   close(v[0].dy, 100);
+});
+
+test('crossing subpaths set the crossing flag', () => {
+  const a = poly([[0, 0], [100, 0], [100, 100], [0, 100]]);
+  const b = poly([[50, 50], [150, 50], [150, 150], [50, 150]]); // edges cross a's edges
+  assert.equal(areaCentroid(shape([a, b])).crossing, true);
+});
+
+test('nested or lone subpaths do not set the crossing flag', () => {
+  const outer = poly([[0, 0], [100, 0], [100, 100], [0, 100]]);
+  const hole = poly([[60, 20], [80, 20], [80, 50], [60, 50]]);
+  assert.equal(areaCentroid(shape([outer, hole], true)).crossing, false);
+  assert.equal(areaCentroid(shape([outer])).crossing, false);
+});
+
+test('a self-intersecting bow-tie sets the crossing flag', () => {
+  const bow = poly([[0, 0], [100, 100], [100, 0], [0, 100]]);
+  assert.equal(areaCentroid(shape([bow])).crossing, true);
+});
+
+test('group: the crossing flag is set when any member crosses itself', () => {
+  const clean = shape([poly([[0, 0], [100, 0], [100, 100], [0, 100]])]);
+  const bow = shape([poly([[0, 0], [100, 100], [100, 0], [0, 100]])]);
+  assert.equal(groupCentroid([clean, clean]).crossing, false);
+  assert.equal(groupCentroid([clean, bow]).crossing, true);
 });
 
 test('square centroid equals its bbox center', () => {

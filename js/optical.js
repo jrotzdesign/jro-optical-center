@@ -60,6 +60,31 @@
 
   var DEFAULT_TOLERANCE = 0.05;
 
+  function side(a, b, c) { return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]); }
+
+  // Proper crossing only: touching endpoints and collinear overlaps do not count.
+  function segmentsCross(a, b, c, d) {
+    var d1 = side(a, b, c), d2 = side(a, b, d), d3 = side(c, d, a), d4 = side(c, d, b);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+  }
+
+  // polys: arrays of {anchor}. True when any two non-neighbouring edges cross.
+  function anyCrossing(polys) {
+    var edges = [];
+    polys.forEach(function (poly, pi) {
+      var n = poly.length;
+      for (var i = 0; i < n; i++) edges.push({ a: poly[i].anchor, b: poly[(i + 1) % n].anchor, p: pi, i: i, n: n });
+    });
+    for (var x = 0; x < edges.length; x++) {
+      for (var y = x + 1; y < edges.length; y++) {
+        var e = edges[x], f = edges[y];
+        if (e.p === f.p && (f.i - e.i === 1 || (e.i === 0 && f.i === e.n - 1))) continue;
+        if (segmentsCross(e.a, e.b, f.a, f.b)) return true;
+      }
+    }
+    return false;
+  }
+
   // Subpaths are assumed nested or disjoint (no crossing). Each region is the path
   // minus its direct children, so a path contributes (filled(self) - filled(parent)).
   function areaCentroid(shape, tol) {
@@ -92,19 +117,25 @@
       cx += c * m[i].cx;
       cy += c * m[i].cy;
     });
-    return { x: cx / (3 * a2), y: cy / (3 * a2), area: a2 / 2 };
+    return {
+      x: cx / (3 * a2),
+      y: cy / (3 * a2),
+      area: a2 / 2,
+      crossing: anyCrossing(paths.map(function (p) { return p.points; }))
+    };
   }
 
   // Known limit: overlapping members are summed, so overlaps count twice.
   function groupCentroid(shapes) {
-    var area = 0, mx = 0, my = 0;
+    var area = 0, mx = 0, my = 0, crossing = false;
     shapes.forEach(function (s) {
       var r = areaCentroid(s);
       area += r.area;
       mx += r.x * r.area;
       my += r.y * r.area;
+      crossing = crossing || r.crossing;
     });
-    return { x: mx / area, y: my / area, area: area };
+    return { x: mx / area, y: my / area, area: area, crossing: crossing };
   }
 
   // lerp(bbox center, centroid, bias). bias is 0..1. An excluded axis returns null.
