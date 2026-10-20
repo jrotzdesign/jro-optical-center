@@ -138,6 +138,22 @@
     return { x: mx / area, y: my / area, area: area, crossing: crossing };
   }
 
+  // Union bounds of the flattened outlines of every path in every shape.
+  function bounds(shapes, tol) {
+    var b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    shapes.forEach(function (s) {
+      s.paths.forEach(function (p) {
+        flatten(p, tol || DEFAULT_TOLERANCE).forEach(function (v) {
+          if (v[0] < b.minX) b.minX = v[0];
+          if (v[0] > b.maxX) b.maxX = v[0];
+          if (v[1] < b.minY) b.minY = v[1];
+          if (v[1] > b.maxY) b.maxY = v[1];
+        });
+      });
+    });
+    return b;
+  }
+
   // lerp(bbox center, centroid, bias). bias is 0..1. An excluded axis returns null.
   function opticalPoint(bbox, centroid, bias, axis) {
     var cx = (bbox.minX + bbox.maxX) / 2, cy = (bbox.minY + bbox.maxY) / 2;
@@ -164,10 +180,71 @@
     });
   }
 
+  // read: the engine's OC_read result. opts: { mode, bias (0..1), axis }.
+  // Returns { deltas, fingerprints, warnings, points } or { error }.
+  function artboardFor(read, bbox) {
+    var cx = (bbox.minX + bbox.maxX) / 2, cy = (bbox.minY + bbox.maxY) / 2, i, a, pick;
+    for (i = 0; i < read.artboards.length; i++) {
+      a = read.artboards[i]; // [left, top, right, bottom], y up
+      if (cx >= a[0] && cx <= a[2] && cy >= a[3] && cy <= a[1]) { pick = a; break; }
+    }
+    pick = pick || read.artboards[read.activeArtboard];
+    return { minX: pick[0], minY: pick[3], maxX: pick[2], maxY: pick[1] };
+  }
+
+  function planMove(read, opts) {
+    var mode = opts.mode, n = read.items.length, warnings = [], points = [], keyIndex = -1, deltas, targets = {};
+    if (n < 1) return { error: 'Select at least one object.' };
+    if (mode === 'container' && n < 2) return { error: 'Select the container and at least one more object.' };
+    if (mode === 'key' && n < 2) return { error: 'Select the key object and at least one more object.' };
+
+    var measured = read.items.map(function (it, i) {
+      var bb = bounds(it.shapes), g = groupCentroid(it.shapes);
+      if (it.isKey) keyIndex = i;
+      if (!isFinite(g.x) || !isFinite(g.y) || !(g.area > 1e-9)) {
+        g = { x: (bb.minX + bb.maxX) / 2, y: (bb.minY + bb.maxY) / 2, crossing: false };
+        warnings.push(it.label + ' has no area, so its box center was used.');
+      } else if (g.crossing) {
+        warnings.push(it.label + ' has crossing paths, so its center may be off.');
+      }
+      (it.warnings || []).forEach(function (w) { warnings.push(it.label + ': ' + w); });
+      return { bbox: bb, centroid: { x: g.x, y: g.y } };
+    });
+
+    if (mode === 'key' && keyIndex < 0) warnings.push('No key is set, so the topmost object is the key.');
+    var anchor = mode === 'container' ? 0 : (mode === 'key' ? Math.max(keyIndex, 0) : -1);
+
+    if (mode === 'artboard') {
+      deltas = measured.map(function (m) {
+        var board = artboardFor(read, m.bbox);
+        targets[board.minX + ',' + board.minY] = { x: (board.minX + board.maxX) / 2, y: (board.minY + board.maxY) / 2, kind: 'target' };
+        return moveDelta({ mode: 'artboard', items: [m], artboard: board, bias: opts.bias, axis: opts.axis })[0];
+      });
+    } else {
+      deltas = moveDelta({ mode: mode, items: measured, keyIndex: keyIndex, bias: opts.bias, axis: opts.axis });
+    }
+
+    measured.forEach(function (m, i) {
+      var o = opticalPoint(m.bbox, m.centroid, opts.bias, 'both');
+      points.push({ x: (m.bbox.minX + m.bbox.maxX) / 2, y: (m.bbox.minY + m.bbox.maxY) / 2, kind: 'box' });
+      points.push({ x: o.x, y: o.y, kind: i === anchor ? 'target' : 'optical' });
+    });
+    Object.keys(targets).forEach(function (k) { points.push(targets[k]); });
+
+    return {
+      deltas: deltas,
+      fingerprints: read.items.map(function (it) { return it.fingerprint; }),
+      warnings: warnings,
+      points: points
+    };
+  }
+
   return {
+    planMove: planMove,
     areaCentroid: areaCentroid,
     groupCentroid: groupCentroid,
     flatten: flatten,
+    bounds: bounds,
     opticalPoint: opticalPoint,
     moveDelta: moveDelta
   };

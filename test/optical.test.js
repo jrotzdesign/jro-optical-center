@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { areaCentroid, groupCentroid, flatten, opticalPoint, moveDelta } = require('../js/optical.js');
+const { areaCentroid, groupCentroid, flatten, opticalPoint, moveDelta, bounds } = require('../js/optical.js');
 
 // Straight-cornered point: handles sit on the anchor, as Illustrator reports them.
 const pt = (x, y) => ({ anchor: [x, y], left: [x, y], right: [x, y] });
@@ -190,6 +190,20 @@ test('group: the crossing flag is set when any member crosses itself', () => {
   const bow = shape([poly([[0, 0], [100, 100], [100, 0], [0, 100]])]);
   assert.equal(groupCentroid([clean, clean]).crossing, false);
   assert.equal(groupCentroid([clean, bow]).crossing, true);
+});
+
+test('bounds: a bezier circle spans its anchors, -100..100 on both axes', () => {
+  const b = bounds([shape([circlePath(100)])]);
+  close(b.minX, -100, 0.01);
+  close(b.maxX, 100, 0.01);
+  close(b.minY, -100, 0.01);
+  close(b.maxY, 100, 0.01);
+});
+
+test('bounds: unions several shapes, negative coordinates included', () => {
+  const a = shape([poly([[-100, -50], [-20, -50], [-20, 30], [-100, 30]])]);
+  const b = shape([poly([[10, 40], [60, 40], [60, 90], [10, 90]])]);
+  assert.deepEqual(bounds([a, b]), { minX: -100, minY: -50, maxX: 60, maxY: 90 });
 });
 
 test('square centroid equals its bbox center', () => {
