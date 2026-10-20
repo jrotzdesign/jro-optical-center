@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionList><Extension Id="com.jro.opticalcenter.panel"><HostList><Host Name="ILST" Port="8733"/></HostList></Extension></ExtensionList>

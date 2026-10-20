@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.jro.opticalcenter" ExtensionBundleVersion="0.1.0" ExtensionBundleName="Optical Center" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.jro.opticalcenter.panel" Version="0.1.0"/>
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <!-- ILST = Illustrator. 28 = 2024, 29 = 2025, 30 = 2026 -->
+      <Host Name="ILST" Version="[28.0,99.9]"/>
+    </HostList>
+    <LocaleList>
+      <Locale Code="All"/>
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="9.0"/>
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.jro.opticalcenter.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <ScriptPath>./jsx/engine.jsx</ScriptPath>
+          <!-- Node is on so the panel can keep presets.json under ~/Library/Application Support/JRO.
+               Smooth Corners does not need this; Optical Center does. -->
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Optical Center</Menu>
+          <Geometry>
+            <Size><Height>640</Height><Width>268</Width></Size>
+            <MinSize><Height>420</Height><Width>240</Width></MinSize>
+            <MaxSize><Height>1400</Height><Width>640</Width></MaxSize>
+          </Geometry>
+          <Icons/>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

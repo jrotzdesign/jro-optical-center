@@ -60,10 +60,27 @@ function OC_layerRank(layer) {
   return 0;
 }
 
-function OC_zKey(item) {
+// Stacking rank inside the parent: higher is nearer the top. pageItems[0] is the topmost item.
+// zOrderPosition is not used first because it is wrong for text frames (it can repeat another item's value).
+function OC_stackRank(item, cache) {
+  var parent = item.parent, entry = null, i, list, map;
+  for (i = 0; i < cache.length; i++) if (cache[i].parent === parent) { entry = cache[i]; break; }
+  if (!entry) {
+    map = {};
+    try {
+      list = parent.pageItems;
+      for (i = 0; i < list.length; i++) map[String(list[i].uuid)] = list.length - i;
+    } catch (e) {}
+    entry = { parent: parent, map: map };
+    cache.push(entry);
+  }
+  return entry.map[String(item.uuid)] || item.zOrderPosition;
+}
+
+function OC_zKey(item, cache) {
   var key = [], cur = item;
   while (cur && cur.typename !== "Document") {
-    key.unshift(cur.typename === "Layer" ? OC_layerRank(cur) : cur.zOrderPosition);
+    key.unshift(cur.typename === "Layer" ? OC_layerRank(cur) : OC_stackRank(cur, cache));
     cur = cur.parent;
   }
   return key;
@@ -76,9 +93,9 @@ function OC_zCompare(a, b) {
 }
 
 function OC_selectionSorted(doc) {
-  var sel = doc.selection, list = [], i;
+  var sel = doc.selection, list = [], cache = [], i;
   if (!sel || !sel.length || sel.typename === "TextRange") return list;
-  for (i = 0; i < sel.length; i++) list.push({ item: sel[i], key: OC_zKey(sel[i]) });
+  for (i = 0; i < sel.length; i++) list.push({ item: sel[i], key: OC_zKey(sel[i], cache) });
   list.sort(function (p, q) { return OC_zCompare(p.key, q.key); });
   return list;
 }
@@ -219,6 +236,18 @@ function OC_collect(item, st, depth) {
   OC_pushBoxShape(item, st, "A " + t + " was measured by its bounding box.");
 }
 
+// Copies an item into the scratch document. duplicate() sometimes returns undefined across
+// documents, so the copy is found at the back of the scratch layer when the return value is empty.
+function OC_copyTo(item, scratch) {
+  var copy = item.duplicate(scratch, ElementPlacement.PLACEATEND), list;
+  if (!copy) {
+    list = scratch.layers[0].pageItems;
+    copy = list[list.length - 1];
+  }
+  if (!copy || copy.typename !== item.typename) throw new Error("Could not copy " + (item.name || item.typename) + " for measuring.");
+  return copy;
+}
+
 // ---------- entry points ----------
 
 function OC_ping() {
@@ -244,9 +273,12 @@ function OC_read(keyUuid, keyDoc) {
     var activeBoard = doc.artboards.getActiveArtboardIndex();
 
     try {
+      // Originals are deselected while we work. A selected item duplicates to another document as
+      // undefined, and with nothing selected here a stray menu command has nothing of yours to hit.
+      doc.selection = null;
       scratch = app.documents.add(DocumentColorSpace.RGB, 200, 200);
       for (i = 0; i < list.length; i++) {
-        var it = list[i].item, gb = it.geometricBounds, copy = it.duplicate(scratch, ElementPlacement.PLACEATEND);
+        var it = list[i].item, gb = it.geometricBounds, copy = OC_copyTo(it, scratch);
         var cb = copy.geometricBounds;
         var st = { doc: scratch, dx: gb[0] - cb[0], dy: gb[1] - cb[1], shapes: [], warnings: [] };
         OC_collect(copy, st, 0);
@@ -261,6 +293,10 @@ function OC_read(keyUuid, keyDoc) {
     } finally {
       if (scratch) { try { scratch.close(SaveOptions.DONOTSAVECHANGES); } catch (e) {} }
       try { app.activeDocument = doc; } catch (e2) {}
+      try {
+        doc.selection = null;
+        for (i = 0; i < list.length; i++) list[i].item.selected = true;
+      } catch (e3) {}
     }
     return { doc: doc.name, items: items, artboards: boards, activeArtboard: activeBoard };
   });

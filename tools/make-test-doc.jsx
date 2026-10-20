@@ -47,6 +47,7 @@ function OC_makeTestDoc() {
     cp.pathItems.rectangle(cy + 40, cells[3] - 50, 100, 80, false);
     cp.pathItems.rectangle(cy + 20, cells[3] - 40, 30, 40, true);
     cp.pathItems[0].fillColor = ink;
+    cp.pathItems[0].stroked = false; // new paths otherwise pick up the default 1 pt stroke
     cp.name = "hole";
     centerByBounds(cp, cells[3], cy);
 

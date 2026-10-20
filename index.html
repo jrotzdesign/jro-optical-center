@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Optical Center</title>
+<link rel="stylesheet" href="css/panel.css">
+<script>
+  /* Show startup errors inside the panel instead of a blank one */
+  window.__ocErr = [];
+  window.onerror = function (msg, src, line) {
+    window.__ocErr.push(msg + " (" + String(src || "").split("/").pop() + ":" + line + ")");
+    var box = document.getElementById("bootError");
+    if (box) { box.style.display = "block"; box.textContent = "Optical Center hit an error:\n" + window.__ocErr.join("\n"); }
+  };
+</script>
+</head>
+<body>
+  <pre id="bootError"></pre>
+
+  <header>
+    <div class="eyebrow">JRO Design · Optical center</div>
+    <h1>Optical center<span class="dot">.</span></h1>
+  </header>
+
+  <section>
+    <div class="eyebrow">Mode</div>
+    <div class="seg" id="modeSeg">
+      <button data-mode="container" class="on">Center in container</button>
+      <button data-mode="key">Align to key object</button>
+      <button data-mode="artboard">Align to artboard</button>
+    </div>
+    <div class="hint" id="modeHint">The topmost selected object stays put. The rest move into it.</div>
+    <div class="keyrow hidden" id="keyRow">
+      <button class="btn small" id="setKey">Set key</button>
+      <button class="btn small ghost" id="clearKey">Clear key</button>
+      <span class="state" id="keyState">No key set</span>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow"><span>Bias</span><span class="value"><span id="biasText">60</span>%</span></div>
+    <div class="bias-row">
+      <div class="slider">
+        <div class="track"></div><div class="fill" id="fill"></div><div class="thumb" id="thumb"></div>
+        <input type="range" id="bias" min="0" max="100" step="1" value="60">
+      </div>
+      <input type="number" id="biasNum" min="0" max="100" step="1" value="60">
+    </div>
+    <div class="hint">0% uses the bounding box. 100% uses the center of mass. Most icons look right near 60%.</div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Presets</div>
+    <div class="chips" id="chips"></div>
+    <div class="save-row">
+      <input type="text" id="presetName" placeholder="Preset name" maxlength="40">
+      <button class="btn small" id="savePreset">Save preset</button>
+    </div>
+  </section>
+
+  <section>
+    <div class="btns">
+      <button class="btn primary" id="goBoth">Optical center</button>
+      <div class="two">
+        <button class="btn" id="goH">Horizontal only</button>
+        <button class="btn" id="goV">Vertical only</button>
+      </div>
+      <button class="btn" id="preview">Preview markers</button>
+    </div>
+    <div class="legend"><span class="box"><i></i>Box center</span><span class="opt"><i></i>Optical point</span></div>
+  </section>
+
+  <div class="status" id="status" role="status">Select objects, then pick a button.</div>
+
+  <script src="js/CSInterface.js"></script>
+  <script src="js/optical.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
