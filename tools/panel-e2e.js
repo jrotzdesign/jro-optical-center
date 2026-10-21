@@ -2,7 +2,8 @@
 // Needs: Illustrator running with the Optical Center panel open. The script opens a temporary copy
 // of test/fixtures/optical-center-test.ai (the committed fixture is never modified, and your open
 // files are not touched) and closes it unsaved at the end. Run: node tools/panel-e2e.js [screenshotDir]
-// It clicks the real buttons and fails on any console error. Undo is a real Cmd+Z keystroke when
+// It clicks the real buttons and fails on any console error. Any host call that takes over 20 s
+// stops the run. Undo is a real Cmd+Z keystroke when
 // macOS allows it (Accessibility permission for the terminal), otherwise Illustrator's Edit > Undo.
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
@@ -39,15 +40,21 @@ async function connect() {
 
 (async () => {
   const p = await connect();
-  const host = (jsx) => p.evaluate(`new Promise(r => window.__adobe_cep__.evalScript(${JSON.stringify(jsx)}, r))`);
+  const host = (jsx) => Promise.race([
+    p.evaluate(`new Promise(r => window.__adobe_cep__.evalScript(${JSON.stringify(jsx)}, r))`),
+    sleep(20000).then(() => { throw new Error('host call took over 20 s, stopping: ' + jsx.slice(0, 80)); }),
+  ]);
   const hostJSON = async (jsx) => JSON.parse(await host(jsx));
-  const panel = () => p.evaluate(`JSON.stringify({ live: document.getElementById('live').innerText, status: document.getElementById('status').innerText, hint: !document.getElementById('textHint').classList.contains('hidden'), disabled: document.getElementById('goBoth').disabled })`).then(JSON.parse);
+  const panel = () => p.evaluate(`JSON.stringify({ live: document.getElementById('live').innerText, status: document.getElementById('status').innerText, disabled: document.getElementById('goBoth').disabled })`).then(JSON.parse);
   const click = (id) => p.evaluate(`document.getElementById('${id}').click(); true`);
   // An action clears the status line when it starts and writes it when it ends.
   const waitIdle = async () => { for (let i = 0; i < 80; i++) { await sleep(150); if (await p.evaluate('document.getElementById("status").innerText.trim() !== ""')) break; } await sleep(300); };
   const select = (names) => host(`(function(){var d=app.activeDocument;d.selection=null;${names.map((n) => `d.pageItems.getByName(${JSON.stringify(n)}).selected=true;`).join('')}return d.selection.length;})()`);
   const bounds = (name) => hostJSON(`(function(){var b=app.activeDocument.pageItems.getByName(${JSON.stringify(name)}).geometricBounds;return '['+b.join(',')+']';})()`);
   const docs = () => host('app.documents.length + ""').then(Number);
+  const itemCount = () => host('app.activeDocument.pageItems.length + ""').then(Number);
+  const root = await p.evaluate('decodeURI(String(new CSInterface().getExtensionPath()).replace(/^file:\\/\\//, ""))');
+  const plan = (axis) => hostJSON(`OC_act("plan", ${JSON.stringify(axis)}, 0.6, "", "", ${JSON.stringify(root)})`);
   let undoMethod = null;
   const cmdZ = async () => {
     try {
@@ -80,8 +87,11 @@ async function connect() {
   if (missing) throw new Error('fixture copy is missing: ' + missing);
   await sleep(800);
 
-  // 0. Loaded properly
-  check('window.Optical is loaded in CEP', await p.evaluate('typeof window.Optical === "object" && typeof window.Optical.planMove === "function"'));
+  // 0. Loaded properly: optical.js runs in the host, and its ES5 helpers do not outlive a call
+  await select([]);
+  const loaded = await plan('both').catch((e) => ({ ok: false, error: String(e) }));
+  check('optical.js loads in the host engine', loaded.ok === false && loaded.code === 'no-selection', loaded);
+  check('no ES5 helpers left on Array.prototype', (await host('typeof Array.prototype.forEach')) === 'undefined');
 
   // 1. Layout fits without scrolling: at the panel's current size and at the manifest default 268 x 340
   const cur = await p.evaluate('JSON.stringify({ h: innerHeight, w: innerWidth, content: document.documentElement.scrollHeight })').then(JSON.parse);
@@ -145,27 +155,33 @@ async function connect() {
   const starBefore = await bounds('star');
   await click('goBoth');
   await waitIdle();
-  const read = await hostJSON('OC_read("","")');
-  const plan = await p.evaluate(`JSON.stringify(Optical.planMove(${JSON.stringify(read)}, { bias: 0.6, axis: 'both' }))`).then(JSON.parse);
-  check('one object: its optical point now sits on the artboard center', plan.deltas.every((d) => near(d.dx, 0, 0.01) && near(d.dy, 0, 0.01)), plan.deltas);
-  check('one object: no scratch document for shapes', read.usedScratch === false);
+  const again = await plan('both');
+  check('one object: its optical point now sits on the artboard center', again.deltas.every((d) => near(d.dx, 0, 0.01) && near(d.dy, 0, 0.01)), again.deltas);
   await cmdZ(); await sleep(1000);
   const starUndo = await bounds('star');
   check('one object: one Cmd+Z reverts', starUndo.every((v, i) => near(v, starBefore[i])));
 
-  // 6. Live text shows the hint and still works (a brief scratch document is allowed here only)
+  // 6. Live text: outlined on a copy inside this document, no new tab, one undo step, no leftovers
   await select(['container-3', 'J']);
   await sleep(1800);
-  s = await panel();
-  check('text selected: the outline hint shows', s.hint, s.live);
-  const jBefore = await bounds('J');
+  const jBefore = await bounds('J'), itemsBefore = await itemCount(), jDocs = await docs();
+  const jPlan = await plan('both');
   await click('goBoth');
   await waitIdle();
   s = await panel();
   const jAfter = await bounds('J');
-  check('text: moves and the scratch document is gone again', !jAfter.every((v, i) => near(v, jBefore[i])) && (await docs()) === docsBefore, s.status);
+  const jdx = jAfter[0] - jBefore[0], jdy = jAfter[1] - jBefore[1];
+  check('text: no new document during the move', (await docs()) === jDocs, { before: jDocs });
+  check('text: the J moves by the planned amount', near(jdx, jPlan.deltas[0].dx, 0.01) && near(jdy, jPlan.deltas[0].dy, 0.01) && Math.abs(jPlan.deltas[0].dx) + Math.abs(jPlan.deltas[0].dy) > 0.1, { jdx: jdx.toFixed(3), jdy: jdy.toFixed(3), planned: jPlan.deltas[0], status: s.status });
+  check('text: no leftover items after the move', (await itemCount()) === itemsBefore, { before: itemsBefore });
+  check('text: the J is still live text', (await host('app.activeDocument.pageItems.getByName("J").typename')) === 'TextFrame');
+  await click('goBoth');
+  await waitIdle();
+  s = await panel();
+  check('text: a second press says already centered and does not move', s.status.trim() === 'Already centered.' && (await bounds('J')).every((v, i) => near(v, jAfter[i], 0.001)), s.status);
   await cmdZ(); await sleep(1000);
-  check('text: one Cmd+Z reverts', (await bounds('J')).every((v, i) => near(v, jBefore[i])));
+  check('text: one undo reverts, even after the second press', (await bounds('J')).every((v, i) => near(v, jBefore[i])));
+  check('text: no leftover items after undo', (await itemCount()) === itemsBefore);
 
   // 7. Errors read as plain English
   await select(['container-1', 'play']);

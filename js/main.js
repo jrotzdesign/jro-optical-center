@@ -1,10 +1,15 @@
-/* Optical Center panel logic. Geometry lives in optical.js; the document work lives in jsx/engine.jsx. */
+/* Optical Center panel logic. The document work and the geometry (js/optical.js, loaded into the
+   host) both run inside jsx/engine.jsx, so one button press is one script call and one undo step. */
 (function () {
   var cs = new CSInterface();
   var $ = function (id) { return document.getElementById(id); };
 
   var SEED = [{ name: "Play icon", bias: 70 }, { name: "Logomark", bias: 50 }];
   var POLL_MS = 800;
+  var TIMEOUT_MS = 20000;
+
+  // The extension folder, for the host to load js/optical.js from.
+  var ROOT = decodeURI(String(cs.getExtensionPath()).replace(/^file:\/\//, ""));
 
   // Everything the user can see in the status line. Raw script errors never reach it.
   var MESSAGES = {
@@ -14,6 +19,7 @@
     "key-needs-one": "Select just one object, then press Set key.",
     "copy-failed": "Some text couldn't be measured. Outline it and try again.",
     "no-answer": "Illustrator didn't answer. Close any open dialog and try again.",
+    "timeout": "Illustrator took longer than 20 seconds. Check the artwork before you try again.",
     "internal": "Something went wrong. Try again, or close and reopen the panel."
   };
 
@@ -26,7 +32,12 @@
   function host(fn) {
     var args = Array.prototype.slice.call(arguments, 1).map(function (a) { return JSON.stringify(a); });
     return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () { done = true; reject(new PanelError("timeout", fn + " took over " + TIMEOUT_MS + " ms")); }, TIMEOUT_MS);
       cs.evalScript(fn + "(" + args.join(",") + ")", function (raw) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
         if (typeof raw !== "string" || raw.charAt(0) !== "{") { reject(new PanelError("no-answer", raw)); return; }
         var res;
         try { res = JSON.parse(raw); } catch (e) { reject(new PanelError("internal", "unparseable reply: " + raw.slice(0, 120))); return; }
@@ -37,10 +48,10 @@
 
   function plain(e) {
     if (e instanceof PanelError) {
-      if (e.code === "internal" || e.code === "no-answer") console.info("[Optical Center] " + e.code + ": " + e.detail);
+      if (e.code === "plan") return e.detail;
+      if (e.code === "internal" || e.code === "no-answer" || e.code === "timeout") console.info("[Optical Center] " + e.code + ": " + e.detail);
       return MESSAGES[e.code] || MESSAGES.internal;
     }
-    if (e && e.planMessage) return e.planMessage;
     console.info("[Optical Center] " + (e && e.stack ? e.stack : e));
     return MESSAGES.internal;
   }
@@ -66,15 +77,15 @@
     return cap(movers.length === 1 ? movers[0] : movers.length + " objects") + " center" + (movers.length === 1 ? "s" : "") + " inside " + anchor + ".";
   }
 
-  function movedLine(plan, res, axis) {
+  function movedLine(res, axis) {
     if (!res.moved) return "Already centered.";
     var moving = [];
-    plan.deltas.forEach(function (d, i) { if (Math.abs(d.dx) > 1e-9 || Math.abs(d.dy) > 1e-9) moving.push(i); });
+    res.deltas.forEach(function (d, i) { if (Math.abs(d.dx) >= 0.001 || Math.abs(d.dy) >= 0.001) moving.push(i); });
     if (moving.length !== 1) return "Moved " + res.moved + " objects" + (axis === "h" ? " horizontally." : axis === "v" ? " vertically." : ".");
-    var d = plan.deltas[moving[0]], parts = [];
+    var d = res.deltas[moving[0]], parts = [];
     if (Math.abs(d.dx) >= 0.05) parts.push(pt(d.dx) + (d.dx > 0 ? " right" : " left"));
     if (Math.abs(d.dy) >= 0.05) parts.push(pt(d.dy) + (d.dy > 0 ? " up" : " down"));
-    return parts.length ? "Moved " + plan.labels[moving[0]] + " " + parts.join(" and ") + "." : "Already centered.";
+    return parts.length ? "Moved " + res.labels[moving[0]] + " " + parts.join(" and ") + "." : "Already centered.";
   }
 
   // ---------- status and controls ----------
@@ -93,7 +104,6 @@
   function renderPeek() {
     var p = state.peek, can = !!(p && p.count && !p.editingText) && !state.busy;
     $("live").textContent = describe(p);
-    $("textHint").classList.toggle("hidden", !(p && p.hasText));
     ["goBoth", "goH", "goV", "preview"].forEach(function (id) { $(id).disabled = !can; });
   }
 
@@ -191,25 +201,18 @@
 
   // ---------- actions ----------
 
-  function readAndPlan(axis) {
-    return host("OC_read", state.key ? state.key.uuid : "", state.key ? state.key.doc : "").then(function (read) {
-      var plan = Optical.planMove(read, { bias: state.bias / 100, axis: axis });
-      if (plan.error) { var err = new Error(plan.error); err.planMessage = plan.error; throw err; }
-      return plan;
-    });
+  function hostAct(action, axis) {
+    return host("OC_act", action, axis, state.bias / 100, state.key ? state.key.uuid : "", state.key ? state.key.doc : "", ROOT);
   }
 
   function act(axis) {
     if (state.busy) return;
     setBusy(true);
     setStatus("", "");
-    readAndPlan(axis)
-      .then(function (plan) {
-        // Markers are cleared in their own call so one undo reverts only the move.
-        return host("OC_clearMarkers").then(function () {
-          return host("OC_move", JSON.stringify({ fingerprints: plan.fingerprints, deltas: plan.deltas }));
-        }).then(function (res) { setStatus("ok", movedLine(plan, res, axis), plan.warnings); });
-      })
+    // Markers are cleared in their own call so one undo reverts only the move.
+    host("OC_clearMarkers")
+      .then(function () { return hostAct("move", axis); })
+      .then(function (res) { setStatus("ok", movedLine(res, axis), res.warnings); })
       .catch(function (e) { setStatus("err", plain(e)); })
       .then(function () { setBusy(false); });
   }
@@ -217,12 +220,8 @@
   function preview() {
     if (state.busy) return;
     setBusy(true);
-    readAndPlan("both")
-      .then(function (plan) {
-        return host("OC_preview", JSON.stringify({ points: plan.points })).then(function () {
-          setStatus("ok", "Markers drawn. They clear on the next move.", plan.warnings);
-        });
-      })
+    hostAct("preview", "both")
+      .then(function (res) { setStatus("ok", "Markers drawn. They clear on the next move.", res.warnings); })
       .catch(function (e) { setStatus("err", plain(e)); })
       .then(function () { setBusy(false); });
   }
@@ -261,8 +260,11 @@
       setStatus("ok", "Saved " + name + " at " + state.bias + "%.");
     });
 
-    // A marker layer left behind by a crash or a closed panel should not survive a reopen.
-    host("OC_clearMarkers")
+    // Illustrator loads engine.jsx once per session; loading it again here keeps the host code in
+    // step with this panel after a reinstall or reload.
+    new Promise(function (resolve) { cs.evalScript("$.evalFile(" + JSON.stringify(ROOT + "/jsx/engine.jsx") + ")", resolve); })
+      // A marker layer left behind by a crash or a closed panel should not survive a reopen.
+      .then(function () { return host("OC_clearMarkers"); })
       .then(function (res) { if (res.removed) setStatus("", "Removed leftover markers."); })
       .catch(function () {})
       .then(function () { if (presetNote) setStatus("err", presetNote); poll(); });

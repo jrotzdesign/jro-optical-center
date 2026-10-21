@@ -1,12 +1,15 @@
 /* Optical Center: ExtendScript engine.
    Every entry point returns a JSON string: {ok:true, ...} or {ok:false, error}.
-   Geometry is read straight from the live document: reading changes nothing and adds no undo
-   steps. Strokes are sent as their style (width, join, cap) and turned into mass by optical.js.
-   Live text is the one exception: it is outlined on a copy in a scratch document that is opened
-   and closed within the same call. Only OC_move and the marker layer change the document. */
+   A button press is one OC_act call: it reads the selection, plans the move with js/optical.js
+   loaded into this engine, and moves, so the whole action is one undo step. Shapes are read
+   straight from the paths; strokes are sent as their style (width, join, cap) and turned into
+   mass by optical.js. Live text is outlined on a copy in the same document that is removed again
+   before the call returns, so no other document ever opens. */
 
 var OC_MARKER_LAYER = "__optical_center_markers__";
 var OC_MAX_DEPTH = 12;
+$.global.OC_optical = null; // the panel reloads engine.jsx when it opens, so optical.js is read fresh too
+$.global.OC_centered = null;
 
 // ---------- plumbing ----------
 
@@ -25,11 +28,6 @@ function OC_json(v) {
   }
   for (var k in v) if (v.hasOwnProperty(k)) out.push(OC_json(k) + ":" + OC_json(v[k]));
   return "{" + out.join(",") + "}";
-}
-
-function OC_parse(s) {
-  if (!/^[\s\w\[\]{},:."+\-]*$/.test(s)) throw new Error("Unexpected characters in panel payload.");
-  return eval("(" + s + ")");
 }
 
 // Alert suppression and the document coordinate system (y up) wrap every call.
@@ -160,16 +158,6 @@ function OC_describe(item) {
   return "the object";
 }
 
-function OC_hasText(item, depth) {
-  var i;
-  if (depth > 4) return false;
-  if (item.typename === "TextFrame") return true;
-  if (item.typename === "GroupItem") {
-    for (i = 0; i < item.pageItems.length && i < 200; i++) if (OC_hasText(item.pageItems[i], depth + 1)) return true;
-  }
-  return false;
-}
-
 // ---------- geometry extraction (read-only) ----------
 
 function OC_pathData(p, st) {
@@ -251,42 +239,96 @@ function OC_collect(item, st, depth) {
   OC_pushBoxPiece(item, st, OC_describe(item).replace(/^the /, "The ") + " is measured by its bounding box.");
 }
 
-// Copies an item into the scratch document. duplicate() returns undefined when the original is
-// selected, so callers deselect first; the copy is also looked up at the back of the layer.
-function OC_copyTo(item, scratch) {
-  var copy = item.duplicate(scratch, ElementPlacement.PLACEATEND), list;
-  if (!copy) {
-    list = scratch.layers[0].pageItems;
-    copy = list[list.length - 1];
-  }
-  if (!copy || copy.typename !== item.typename) OC_fail("copy-failed", "Could not copy " + OC_describe(item) + " for measuring.");
-  return copy;
-}
-
-// Outlines queued text frames on copies in one scratch document, then closes it unsaved.
-function OC_readTexts(doc, entries, list) {
-  var scratch = null, i, j;
+// Outlines queued text frames on copies made in place, reads the outlines, and removes the copies.
+// The caller's script is still running, so the copies are never drawn and add no undo step of their own.
+// The selection is left alone: clearing and restoring it here stops Edit > Undo from reverting the move.
+function OC_readTexts(entries) {
+  var made = [], i, j;
   try {
-    doc.selection = null;
-    scratch = app.documents.add(DocumentColorSpace.RGB, 200, 200);
     for (i = 0; i < entries.length; i++) {
       var st = entries[i].st;
       for (j = 0; j < st.texts.length; j++) {
-        var tf = st.texts[j], gb = tf.geometricBounds, copy = OC_copyTo(tf, scratch), cb = copy.geometricBounds, g = null;
+        var tf = st.texts[j], gb = tf.geometricBounds, copy = tf.duplicate(), g = null, cb;
+        if (!copy || copy.typename !== "TextFrame") OC_fail("copy-failed", "Could not copy " + OC_describe(tf) + " for measuring.");
+        made.push(copy);
+        cb = copy.geometricBounds;
         try { g = copy.createOutline(); } catch (e) { g = null; }
         var sub = { dx: gb[0] - cb[0], dy: gb[1] - cb[1], pieces: st.pieces, warnings: st.warnings, texts: [] };
-        if (g) OC_collect(g, sub, 0);
+        if (g) { made[made.length - 1] = g; OC_collect(g, sub, 0); }
         else { sub.dx = 0; sub.dy = 0; OC_pushBoxPiece(tf, sub, "Text could not be outlined, so its box was used."); }
       }
     }
   } finally {
-    if (scratch) { try { scratch.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {} }
-    try { app.activeDocument = doc; } catch (e3) {}
-    try {
-      doc.selection = null;
-      for (i = 0; i < list.length; i++) list[i].item.selected = true;
-    } catch (e4) {}
+    for (i = made.length - 1; i >= 0; i--) { try { made[i].remove(); } catch (e2) {} }
   }
+}
+
+// Reads the selection (topmost first) in the shape planMove takes: fill flag, stroke style, bezier paths.
+function OC_readSelection(doc, list, keyUuid, keyDoc) {
+  var entries = [], boards = [], items = [], i, withText = false;
+  if (!list.length) OC_fail("no-selection", "Nothing is selected.");
+
+  for (i = 0; i < doc.artboards.length; i++) boards.push(doc.artboards[i].artboardRect);
+
+  for (i = 0; i < list.length; i++) {
+    var st = { dx: 0, dy: 0, pieces: [], warnings: [], texts: [] };
+    OC_collect(list[i].item, st, 0);
+    if (st.texts.length) withText = true;
+    entries.push({ item: list[i].item, st: st });
+  }
+  if (withText) OC_readTexts(entries);
+
+  for (i = 0; i < entries.length; i++) {
+    var it = entries[i].item;
+    items.push({
+      label: OC_describe(it),
+      isKey: !!keyUuid && String(it.uuid) === String(keyUuid) && doc.name === keyDoc,
+      fingerprint: OC_fingerprint(it),
+      pieces: entries[i].st.pieces,
+      warnings: entries[i].st.warnings
+    });
+  }
+  return { list: list, withText: withText, read: { doc: doc.name, items: items, artboards: boards, activeArtboard: doc.artboards.getActiveArtboardIndex() } };
+}
+
+// ---------- optical.js in the host ----------
+
+// optical.js uses a few ES5 helpers that ExtendScript (ES3) lacks. Every panel in Illustrator shares
+// this engine, and an added Array.prototype method shows up in other scripts' for-in loops, so the
+// helpers exist only for the length of one call.
+var OC_ES5 = {
+  forEach: function (f, t) { for (var i = 0; i < this.length; i++) f.call(t, this[i], i, this); },
+  map: function (f, t) { var r = []; for (var i = 0; i < this.length; i++) r.push(f.call(t, this[i], i, this)); return r; },
+  filter: function (f, t) { var r = []; for (var i = 0; i < this.length; i++) if (f.call(t, this[i], i, this)) r.push(this[i]); return r; },
+  every: function (f, t) { for (var i = 0; i < this.length; i++) if (!f.call(t, this[i], i, this)) return false; return true; },
+  some: function (f, t) { for (var i = 0; i < this.length; i++) if (f.call(t, this[i], i, this)) return true; return false; }
+};
+
+function OC_withES5(fn) {
+  var added = [], keys = false, k, i;
+  for (k in OC_ES5) if (OC_ES5.hasOwnProperty(k) && !Array.prototype[k]) { Array.prototype[k] = OC_ES5[k]; added.push(k); }
+  if (!Object.keys) {
+    Object.keys = function (o) { var r = []; for (var p in o) if (o.hasOwnProperty(p)) r.push(p); return r; };
+    keys = true;
+  }
+  try {
+    return fn();
+  } finally {
+    for (i = 0; i < added.length; i++) delete Array.prototype[added[i]];
+    if (keys) delete Object.keys;
+  }
+}
+
+// root is the extension folder, sent by the panel.
+function OC_lib(root) {
+  if (!$.global.OC_optical) {
+    var f = new File(root + "/js/optical.js");
+    if (!f.exists) OC_fail("internal", "optical.js not found at " + f.fsName);
+    $.evalFile(f);
+    $.global.OC_optical = $.global.Optical;
+    try { delete $.global.Optical; } catch (e) {}
+  }
+  return $.global.OC_optical;
 }
 
 // ---------- entry points ----------
@@ -299,21 +341,20 @@ function OC_ping() {
 // so polling it costs one pass over the selected items when nothing has changed.
 function OC_peek(keyUuid, keyDoc) {
   return OC_run(function () {
-    if (app.documents.length === 0) return { doc: null, count: 0, labels: [], hasText: false, keyInSelection: false };
+    if (app.documents.length === 0) return { doc: null, count: 0, labels: [], keyInSelection: false };
     var doc = app.activeDocument, sel = doc.selection, sig = doc.name, i, n;
-    if (!sel || sel.typename === "TextRange") return { doc: doc.name, count: 0, labels: [], hasText: false, keyInSelection: false, editingText: !!sel };
+    if (!sel || sel.typename === "TextRange") return { doc: doc.name, count: 0, labels: [], keyInSelection: false, editingText: !!sel };
     n = sel.length;
     for (i = 0; i < n && i < 400; i++) sig += "|" + sel[i].uuid + ":" + sel[i].geometricBounds.join(",");
     // A restack keeps every bound the same, so the cache also expires every 3 seconds.
     sig += "|" + keyUuid + "|" + Math.floor(new Date().getTime() / 3000);
     if ($.global.OC_peekCache && $.global.OC_peekCache.sig === sig) return $.global.OC_peekCache.res;
 
-    var res = { doc: doc.name, count: n, labels: [], hasText: false, keyInSelection: false };
+    var res = { doc: doc.name, count: n, labels: [], keyInSelection: false };
     if (n <= 40) {
       var list = OC_selectionSorted(doc);
       for (i = 0; i < list.length; i++) {
         res.labels.push(OC_describe(list[i].item));
-        if (OC_hasText(list[i].item, 0)) res.hasText = true;
         if (keyUuid && String(list[i].item.uuid) === String(keyUuid) && doc.name === keyDoc) res.keyInSelection = true;
       }
     }
@@ -328,38 +369,6 @@ function OC_peekKey() {
     var doc = OC_doc(), sel = doc.selection;
     if (!sel || sel.typename === "TextRange" || sel.length !== 1) OC_fail("key-needs-one", "Select exactly one object to set as the key.");
     return { uuid: sel[0].uuid, doc: doc.name, label: OC_describe(sel[0]) };
-  });
-}
-
-// Reads the selection (topmost first) as pieces: fill flag, stroke style, bezier paths.
-function OC_read(keyUuid, keyDoc) {
-  return OC_run(function () {
-    var doc = OC_doc(), list = OC_selectionSorted(doc), entries = [], boards = [], i, withText = false;
-    if (!list.length) OC_fail("no-selection", "Nothing is selected.");
-
-    for (i = 0; i < doc.artboards.length; i++) boards.push(doc.artboards[i].artboardRect);
-    var activeBoard = doc.artboards.getActiveArtboardIndex();
-
-    for (i = 0; i < list.length; i++) {
-      var st = { dx: 0, dy: 0, pieces: [], warnings: [], texts: [] };
-      OC_collect(list[i].item, st, 0);
-      if (st.texts.length) withText = true;
-      entries.push({ item: list[i].item, st: st });
-    }
-    if (withText) OC_readTexts(doc, entries, list);
-
-    var items = [];
-    for (i = 0; i < entries.length; i++) {
-      var it = entries[i].item;
-      items.push({
-        label: OC_describe(it),
-        isKey: !!keyUuid && String(it.uuid) === String(keyUuid) && doc.name === keyDoc,
-        fingerprint: OC_fingerprint(it),
-        pieces: entries[i].st.pieces,
-        warnings: entries[i].st.warnings
-      });
-    }
-    return { doc: doc.name, items: items, artboards: boards, activeArtboard: activeBoard, usedScratch: withText };
   });
 }
 
@@ -384,30 +393,27 @@ function OC_clearMarkers() {
   });
 }
 
-// payload: {points:[{x, y, kind: "box"|"optical"|"target"}]}. Drawn once, on a locked non-printing layer.
-function OC_preview(payload) {
-  return OC_run(function () {
-    var doc = OC_doc(), data = OC_parse(payload), prev = doc.activeLayer, layer, i, p, arm, c;
-    var colors = { box: OC_rgb(228, 0, 124), optical: OC_rgb(41, 161, 145), target: OC_rgb(41, 161, 145) };
-    while (OC_markerLayer(doc)) { var old = OC_markerLayer(doc); old.locked = false; old.remove(); }
-    layer = doc.layers.add();
-    layer.name = OC_MARKER_LAYER;
-    layer.printable = false;
-    for (i = 0; i < data.points.length; i++) {
-      p = data.points[i];
-      c = colors[p.kind] || colors.optical;
-      arm = p.kind === "target" ? 9 : 6;
-      OC_line(layer, [[p.x - arm, p.y], [p.x + arm, p.y]], c);
-      OC_line(layer, [[p.x, p.y - arm], [p.x, p.y + arm]], c);
-      if (p.kind !== "box") {
-        var ring = layer.pathItems.ellipse(p.y + 3, p.x - 3, 6, 6);
-        ring.filled = false; ring.stroked = true; ring.strokeWidth = 1; ring.strokeColor = c;
-      }
+// points: [{x, y, kind: "box"|"optical"|"target"}]. Drawn on a locked non-printing layer.
+function OC_drawMarkers(doc, points) {
+  var prev = doc.activeLayer, layer, i, p, arm, c;
+  var colors = { box: OC_rgb(228, 0, 124), optical: OC_rgb(41, 161, 145), target: OC_rgb(41, 161, 145) };
+  while (OC_markerLayer(doc)) { var old = OC_markerLayer(doc); old.locked = false; old.remove(); }
+  layer = doc.layers.add();
+  layer.name = OC_MARKER_LAYER;
+  layer.printable = false;
+  for (i = 0; i < points.length; i++) {
+    p = points[i];
+    c = colors[p.kind] || colors.optical;
+    arm = p.kind === "target" ? 9 : 6;
+    OC_line(layer, [[p.x - arm, p.y], [p.x + arm, p.y]], c);
+    OC_line(layer, [[p.x, p.y - arm], [p.x, p.y + arm]], c);
+    if (p.kind !== "box") {
+      var ring = layer.pathItems.ellipse(p.y + 3, p.x - 3, 6, 6);
+      ring.filled = false; ring.stroked = true; ring.strokeWidth = 1; ring.strokeColor = c;
     }
-    layer.locked = true;
-    try { doc.activeLayer = prev; } catch (e) {}
-    return { drawn: data.points.length };
-  });
+  }
+  layer.locked = true;
+  try { doc.activeLayer = prev; } catch (e) {}
 }
 
 function OC_rgb(r, g, b) { var c = new RGBColor(); c.red = r; c.green = g; c.blue = b; return c; }
@@ -418,21 +424,46 @@ function OC_line(layer, pts, color) {
   l.filled = false; l.stroked = true; l.strokeWidth = 1; l.strokeColor = color;
 }
 
-// payload: {fingerprints:[...], deltas:[{dx, dy}]} in the same topmost-first order OC_read used.
-// One script run, so one undo step.
-function OC_move(payload) {
+// Reading live text leaves an undo step even when nothing moves. After a text move the result is
+// remembered, so pressing again on the same unchanged selection answers "already centered" without
+// reading, and one undo still reverts the move.
+function OC_selectionSig(doc, list, axis, bias, keyUuid) {
+  var sig = [doc.name, axis, bias, keyUuid], i, it;
+  for (i = 0; i < doc.artboards.length; i++) sig.push(doc.artboards[i].artboardRect.join(","));
+  for (i = 0; i < list.length; i++) {
+    it = list[i].item;
+    sig.push(it.uuid + ":" + it.visibleBounds.join(",") + (it.typename === "TextFrame" ? ":" + it.contents : ""));
+  }
+  return sig.join("|");
+}
+
+// One button press. action: "move" moves the selection, "preview" draws markers, "plan" only
+// returns the plan (used by tools/panel-e2e.js). Reading, planning and moving share this one
+// script call, so a move is one undo step, live text included.
+function OC_act(action, axis, bias, keyUuid, keyDoc, root) {
   return OC_run(function () {
-    var doc = OC_doc(), data = OC_parse(payload), list = OC_selectionSorted(doc), i, d, moved = 0;
-    if (list.length !== data.deltas.length) OC_fail("selection-changed", "The selection changed.");
-    for (i = 0; i < list.length; i++) {
-      if (OC_fingerprint(list[i].item) !== data.fingerprints[i]) OC_fail("selection-changed", "The selection changed.");
+    var doc = OC_doc(), lib = OC_lib(root), sel, list = OC_selectionSorted(doc), i, d;
+    if (action === "move" && list.length && $.global.OC_centered === OC_selectionSig(doc, list, axis, bias, keyUuid)) {
+      var still = { moved: 0, deltas: [], labels: [], warnings: [] };
+      for (i = 0; i < list.length; i++) { still.deltas.push({ dx: 0, dy: 0 }); still.labels.push(OC_describe(list[i].item)); }
+      return still;
     }
-    for (i = 0; i < list.length; i++) {
-      d = data.deltas[i];
-      if (Math.abs(d.dx) < 1e-9 && Math.abs(d.dy) < 1e-9) continue;
-      list[i].item.translate(d.dx, d.dy);
-      moved++;
+    sel = OC_readSelection(doc, list, keyUuid, keyDoc);
+    var plan = OC_withES5(function () { return lib.planMove(sel.read, { bias: bias, axis: axis }); });
+    if (plan.error) OC_fail("plan", plan.error);
+    var out = { deltas: plan.deltas, labels: plan.labels, warnings: plan.warnings };
+    if (action === "plan") return out;
+    if (action === "preview") { OC_drawMarkers(doc, plan.points); out.drawn = plan.points.length; return out; }
+    // Re-measuring a centered object can come back a hair off; anything under 0.001 pt is not moved,
+    // so a second press adds no undo step.
+    out.moved = 0;
+    for (i = 0; i < sel.list.length; i++) {
+      d = plan.deltas[i];
+      if (Math.abs(d.dx) < 0.001 && Math.abs(d.dy) < 0.001) continue;
+      sel.list[i].item.translate(d.dx, d.dy);
+      out.moved++;
     }
-    return { moved: moved };
+    $.global.OC_centered = sel.withText ? OC_selectionSig(doc, sel.list, axis, bias, keyUuid) : null;
+    return out;
   });
 }

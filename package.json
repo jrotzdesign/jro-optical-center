@@ -1,6 +1,6 @@
 {
   "name": "jro-optical-center",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Illustrator CEP panel that aligns objects by visual mass instead of bounding box.",
   "scripts": {

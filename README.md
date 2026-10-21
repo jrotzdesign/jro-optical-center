@@ -2,7 +2,7 @@
 
 An Illustrator panel that centers objects by where their visual weight sits, not by their bounding box. A play triangle in a circle looks off-center when its box is centered, because most of the triangle's weight is on the left. Optical Center moves it right until the weight sits in the middle.
 
-Works in Illustrator 2024, 2025 and 2026 (tested on 30.4.0). Version 0.2.0.
+Works in Illustrator 2024, 2025 and 2026 (tested on 30.4.0). Version 0.2.1.
 
 ## Install
 
@@ -30,13 +30,13 @@ Select, then press **Optical center**. The line at the top of the panel says wha
 
 ## Undo
 
-A move is one undo step. Reading the selection changes nothing in the document and adds no undo steps. Markers are cleared in their own step just before a move, so one undo reverts only the move. A second undo brings the markers back, because it undoes the clear. Any leftover marker layer is removed when the panel opens.
+A move is one undo step, live text included. Pressing again on something already centered does nothing and adds no undo step. Markers are cleared in their own step just before a move, so one undo reverts only the move. A second undo brings the markers back, because it undoes the clear. Any leftover marker layer is removed when the panel opens.
 
 ## How it measures
 
 Fills are read straight from the paths. Strokes are turned into mass with math: each stroke is the band within half its width of the path, with its real join (miter with limit, round, bevel) and cap (butt, round, projecting). Compared with Illustrator's own Outline Stroke, this matches exactly on the test L and is within 0.035% on a curved stroke.
 
-Live text is the one case that needs Illustrator to outline it. The panel does that on a copy in a scratch document that opens and closes within the same click, so you may see a document tab flash. Outline text for instant results.
+Live text is outlined on a copy inside your document, measured, and removed again, all within the same click. No other document opens and your text stays live. The measuring and the move happen in one script call, which is what keeps the move to one undo step.
 
 ## Tests
 
@@ -48,7 +48,7 @@ npm test
 
 In Illustrator, with the panel open:
 
-- `node tools/panel-e2e.js [screenshotDir]` drives the real panel through its debug port (`localhost:8733`). It opens a temporary copy of `test/fixtures/optical-center-test.ai`, clicks the buttons, and checks moves, undo, layout fit and console errors. macOS only allows a real Cmd+Z keystroke if the terminal has Accessibility permission; otherwise the script uses Illustrator's Edit → Undo.
+- `node tools/panel-e2e.js [screenshotDir]` drives the real panel through its debug port (`localhost:8733`). It opens a temporary copy of `test/fixtures/optical-center-test.ai`, clicks the buttons, and checks moves, undo, live text, layout fit and console errors. Any host call over 20 seconds stops the run. macOS only allows a real Cmd+Z keystroke if the terminal has Accessibility permission; otherwise the script uses Illustrator's Edit → Undo.
 - `tools/stroke-compare.jsx` compares the stroke math with Outline Stroke on throwaway shapes in a scratch document.
 
 `test/fixtures/optical-center-test.ai` has five circle containers, each holding one subject centered by its box: a play triangle, a star, a live-text J, a compound path with a hole, and a stroke-only L. `tools/make-test-doc.jsx` rebuilds it if it is ever lost.
@@ -61,7 +61,8 @@ In Illustrator, with the panel open:
 - **Crossing or self-intersecting paths** get a warning. The center may be off.
 - **Very wide strokes on tight curves**: the inner edge of the band can fold over itself. The crossing warning shows when that happens.
 - **Images, symbols, meshes and plug-in objects** are measured by their bounding box, with a warning.
-- **Illustrator quirks the engine works around:** `duplicate()` into another document returns `undefined` when the original is selected, and `zOrderPosition` is wrong for text frames, so stacking order comes from `pageItems`.
+- **Live text that's already centered** before the first press leaves one empty undo step, because outlining the copy counts as a change. After a move the panel remembers the result, so pressing again doesn't add one.
+- **Illustrator quirks the engine works around:** clearing and restoring the selection inside the move call stops Edit → Undo from reverting the move, so the engine never touches the selection. `zOrderPosition` is wrong for text frames, so stacking order comes from `pageItems`. ExtendScript has no `Array.prototype.forEach` and friends; the engine adds them only for the length of one call, because every panel shares that engine.
 
 ## Fonts and license
 

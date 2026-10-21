@@ -31,7 +31,6 @@ body { font: 400 12px/1.45 var(--body); padding: 14px 14px 16px; }
 .eyebrow.row { display: flex; justify-content: space-between; align-items: baseline; }
 .value { font: 500 11px/1 var(--mono); color: var(--bone); letter-spacing: .04em; }
 .hint { color: var(--dim); font-size: 11px; margin: 6px 0 0; }
-.hidden { display: none !important; }
 
 /* what will happen */
 .live { font: 800 17px/1.15 var(--display); letter-spacing: -.02em; margin: 8px 0 0; min-height: 40px; }
