@@ -263,8 +263,8 @@ async function connect() {
 
   // 11. A reply slower than 20 s. Illustrator freezes the panel while the script runs, so the checks
   // read the panel after the reply. A click sent mid-call is queued and delivered after the reply;
-  // it must not start a second press. Only a click() from a second debugger connection queues like
-  // that; a CDP mouse event or a click() on this connection lands while the panel is still busy.
+  // it must not start a second press. Only a click() from a second debugger connection reproduced
+  // that; a CDP mouse event or a click() on this connection didn't, even with the guard off.
   await select(['container-4', 'hole']);
   await sleep(1800);
   const holeBefore = await bounds('hole');
