@@ -6,10 +6,18 @@
    mass by optical.js. Live text is outlined on a copy in the same document that is removed again
    before the call returns, so no other document ever opens. */
 
+var OC_ENGINE = "0.2.2"; // must match js/main.js VERSION; the panel checks it on open
 var OC_MARKER_LAYER = "__optical_center_markers__";
+var OC_COPY_NAME = "Optical Center measuring copy";
 var OC_MAX_DEPTH = 12;
+var OC_SKIPPED = "An object with no fill or stroke was skipped.";
 $.global.OC_optical = null; // the panel reloads engine.jsx when it opens, so optical.js is read fresh too
 $.global.OC_centered = null;
+// Test hook for tools/panel-e2e.js: "dup-undefined", "dup-throws", "outline" or "remove" makes that
+// step of the text read fail, so the cleanup paths can be checked in real Illustrator (overriding
+// the DOM methods themselves has no effect); "slow" makes the call take 21 s. It applies to the
+// next OC_act only, which clears it. Always null in normal use.
+$.global.OC_testFault = null;
 
 // ---------- plumbing ----------
 
@@ -107,10 +115,6 @@ function OC_selectionSorted(doc) {
   return list;
 }
 
-function OC_fingerprint(item) {
-  return item.geometricBounds.join(",");
-}
-
 // ---------- plain names for the live line ----------
 
 function OC_near(a, b, tol) { return Math.abs(a - b) <= tol; }
@@ -195,7 +199,7 @@ function OC_pushPiece(item, st, forceFillOnly) {
   if (!first || first.guides) return;
   filled = forceFillOnly ? true : first.filled;
   stroked = !forceFillOnly && first.stroked && first.strokeWidth > 0;
-  if (!filled && !stroked) { st.warnings.push("An object with no fill or stroke was skipped."); return; }
+  if (!filled && !stroked) { st.warnings.push(OC_SKIPPED); return; }
   for (i = 0; i < list.length; i++) paths.push(OC_pathData(list[i], st));
   try { evenodd = first.evenodd; } catch (e) {}
   try { if (stroked && first.strokeDashes && first.strokeDashes.length) st.warnings.push("Dashed strokes are measured as solid."); } catch (e2) {}
@@ -239,33 +243,80 @@ function OC_collect(item, st, depth) {
   OC_pushBoxPiece(item, st, OC_describe(item).replace(/^the /, "The ") + " is measured by its bounding box.");
 }
 
+function OC_fault(step) {
+  if ($.global.OC_testFault === step) throw new Error("injected failure: " + step);
+}
+
+// Copies a text frame just above itself. duplicate() has been seen to make the copy and still
+// return undefined, so in that case the copy is looked up where it was placed.
+function OC_dupText(tf) {
+  var parent = tf.parent, before = parent.pageItems.length, copy, list, k;
+  OC_fault("dup-throws");
+  copy = tf.duplicate(tf, ElementPlacement.PLACEBEFORE);
+  if ($.global.OC_testFault === "dup-undefined") copy = undefined;
+  if (copy) return copy;
+  list = parent.pageItems;
+  if (list.length !== before + 1) return null;
+  for (k = 0; k < list.length; k++) if (list[k].uuid === tf.uuid) break;
+  copy = k > 0 && k < list.length ? list[k - 1] : null;
+  return copy && copy.typename === "TextFrame" ? copy : null;
+}
+
 // Outlines queued text frames on copies made in place, reads the outlines, and removes the copies.
 // The caller's script is still running, so the copies are never drawn and add no undo step of their own.
 // The selection is left alone: clearing and restoring it here stops Edit > Undo from reverting the move.
-function OC_readTexts(entries) {
+// Text that can't be copied or outlined is measured by its box, with a warning. A copy that can't be
+// removed is reported in cleanup (plain English, naming the item) and keeps OC_COPY_NAME so it can
+// be found in the Layers panel.
+function OC_readTexts(entries, cleanup) {
   var made = [], i, j;
   try {
     for (i = 0; i < entries.length; i++) {
       var st = entries[i].st;
       for (j = 0; j < st.texts.length; j++) {
-        var tf = st.texts[j], gb = tf.geometricBounds, copy = tf.duplicate(), g = null, cb;
-        if (!copy || copy.typename !== "TextFrame") OC_fail("copy-failed", "Could not copy " + OC_describe(tf) + " for measuring.");
-        made.push(copy);
+        var tf = st.texts[j], gb = tf.geometricBounds, copy = null, g = null, cb;
+        var sub = { dx: 0, dy: 0, pieces: st.pieces, warnings: st.warnings, texts: [] };
+        try { copy = OC_dupText(tf); } catch (e) { copy = null; }
+        if (!copy) { OC_pushBoxPiece(tf, sub, "Text couldn't be copied for measuring, so its box was used."); continue; }
+        made.push({ item: copy, label: OC_describe(tf) });
+        try { copy.name = OC_COPY_NAME; copy.locked = false; copy.hidden = false; } catch (e2) {}
         cb = copy.geometricBounds;
-        try { g = copy.createOutline(); } catch (e) { g = null; }
-        var sub = { dx: gb[0] - cb[0], dy: gb[1] - cb[1], pieces: st.pieces, warnings: st.warnings, texts: [] };
-        if (g) { made[made.length - 1] = g; OC_collect(g, sub, 0); }
-        else { sub.dx = 0; sub.dy = 0; OC_pushBoxPiece(tf, sub, "Text could not be outlined, so its box was used."); }
+        try { OC_fault("outline"); g = copy.createOutline(); } catch (e3) { g = null; }
+        if (!g) { OC_pushBoxPiece(tf, sub, "Text couldn't be outlined for measuring, so its box was used."); continue; }
+        made[made.length - 1].item = g;
+        try { g.name = OC_COPY_NAME; } catch (e4) {}
+        sub.dx = gb[0] - cb[0];
+        sub.dy = gb[1] - cb[1];
+        OC_collect(g, sub, 0);
       }
     }
   } finally {
-    for (i = made.length - 1; i >= 0; i--) { try { made[i].remove(); } catch (e2) {} }
+    for (i = made.length - 1; i >= 0; i--) {
+      try { OC_fault("remove"); made[i].item.remove(); } catch (e5) {
+        cleanup.push("A measuring copy of " + made[i].label + " couldn't be removed. Delete \u201c" + OC_COPY_NAME + "\u201d in the Layers panel.");
+      }
+    }
   }
+}
+
+// After a text read: the item count must be back to where it was and no measuring copy may remain.
+function OC_checkClean(doc, countBefore, cleanup) {
+  var left = null;
+  if (cleanup.length) return;
+  try { left = doc.pageItems.getByName(OC_COPY_NAME); } catch (e) { left = null; }
+  if (left) cleanup.push("A measuring copy was left in the document. Delete \u201c" + OC_COPY_NAME + "\u201d in the Layers panel.");
+  else if (doc.pageItems.length !== countBefore) cleanup.push("The document has " + (doc.pageItems.length - countBefore) + " more items than before measuring. Check for extra copies of text.");
+}
+
+function OC_without(list, value) {
+  var out = [], i;
+  for (i = 0; i < list.length; i++) if (list[i] !== value) out.push(list[i]);
+  return out;
 }
 
 // Reads the selection (topmost first) in the shape planMove takes: fill flag, stroke style, bezier paths.
 function OC_readSelection(doc, list, keyUuid, keyDoc) {
-  var entries = [], boards = [], items = [], i, withText = false;
+  var entries = [], boards = [], items = [], cleanup = [], i, withText = false, count;
   if (!list.length) OC_fail("no-selection", "Nothing is selected.");
 
   for (i = 0; i < doc.artboards.length; i++) boards.push(doc.artboards[i].artboardRect);
@@ -276,19 +327,31 @@ function OC_readSelection(doc, list, keyUuid, keyDoc) {
     if (st.texts.length) withText = true;
     entries.push({ item: list[i].item, st: st });
   }
-  if (withText) OC_readTexts(entries);
+  if (withText) {
+    count = doc.pageItems.length;
+    try {
+      OC_readTexts(entries, cleanup);
+    } finally {
+      OC_checkClean(doc, count, cleanup);
+      if (cleanup.length) $.global.OC_lastCleanup = cleanup;
+    }
+  }
 
   for (i = 0; i < entries.length; i++) {
     var it = entries[i].item;
+    // Nothing visible to measure (no fill, no stroke, text included): measure it by its box.
+    if (!entries[i].st.pieces.length) {
+      entries[i].st.warnings = OC_without(entries[i].st.warnings, OC_SKIPPED);
+      OC_pushBoxPiece(it, entries[i].st, "It has no fill or stroke, so its box was used.");
+    }
     items.push({
       label: OC_describe(it),
       isKey: !!keyUuid && String(it.uuid) === String(keyUuid) && doc.name === keyDoc,
-      fingerprint: OC_fingerprint(it),
       pieces: entries[i].st.pieces,
       warnings: entries[i].st.warnings
     });
   }
-  return { list: list, withText: withText, read: { doc: doc.name, items: items, artboards: boards, activeArtboard: doc.artboards.getActiveArtboardIndex() } };
+  return { list: list, withText: withText, cleanup: cleanup, read: { doc: doc.name, items: items, artboards: boards, activeArtboard: doc.artboards.getActiveArtboardIndex() } };
 }
 
 // ---------- optical.js in the host ----------
@@ -322,19 +385,25 @@ function OC_withES5(fn) {
 // root is the extension folder, sent by the panel.
 function OC_lib(root) {
   if (!$.global.OC_optical) {
-    var f = new File(root + "/js/optical.js");
-    if (!f.exists) OC_fail("internal", "optical.js not found at " + f.fsName);
+    var f = new File(root + "/js/optical.js"), lib;
+    if (!f.exists) OC_fail("optical-missing", "optical.js not found at " + f.fsName);
     $.evalFile(f);
-    $.global.OC_optical = $.global.Optical;
+    lib = $.global.Optical;
     try { delete $.global.Optical; } catch (e) {}
+    if (!lib || typeof lib.planMove !== "function") OC_fail("optical-missing", "optical.js loaded but did not export planMove");
+    $.global.OC_optical = lib;
   }
   return $.global.OC_optical;
 }
 
 // ---------- entry points ----------
 
-function OC_ping() {
-  return OC_run(function () { return { version: app.version, docs: app.documents.length }; });
+// The panel calls this on open: the engine version tells it whether its own engine.jsx loaded.
+function OC_ping(root) {
+  return OC_run(function () {
+    var lib = OC_lib(root);
+    return { version: app.version, docs: app.documents.length, engine: OC_ENGINE, optical: typeof lib.planMove === "function" };
+  });
 }
 
 // Cheap description of the selection for the panel's live line. Cached by selection signature,
@@ -426,44 +495,106 @@ function OC_line(layer, pts, color) {
 
 // Reading live text leaves an undo step even when nothing moves. After a text move the result is
 // remembered, so pressing again on the same unchanged selection answers "already centered" without
-// reading, and one undo still reverts the move.
-function OC_selectionSig(doc, list, axis, bias, keyUuid) {
-  var sig = [doc.name, axis, bias, keyUuid], i, it;
-  for (i = 0; i < doc.artboards.length; i++) sig.push(doc.artboards[i].artboardRect.join(","));
-  for (i = 0; i < list.length; i++) {
-    it = list[i].item;
-    sig.push(it.uuid + ":" + it.visibleBounds.join(",") + (it.typename === "TextFrame" ? ":" + it.contents : ""));
+// reading, and one undo still reverts the move. The key is a read-only fingerprint of everything that
+// feeds the measurement; stroke alignment isn't readable from scripts. null means don't remember.
+var OC_SIG_MAX = 200000, OC_SIG_TEXT_MAX = 64;
+
+function OC_pathSig(p, out) {
+  var pp = p.pathPoints, i, q;
+  out.push(p.filled, p.stroked, p.strokeWidth, p.strokeJoin, p.strokeCap, p.strokeMiterLimit,
+           p.evenodd, p.closed, p.polarity, p.clipping, p.guides, p.strokeDashes.length);
+  for (i = 0; i < pp.length; i++) {
+    q = pp[i];
+    out.push(q.anchor.join(","), q.leftDirection.join(","), q.rightDirection.join(","));
   }
-  return sig.join("|");
+}
+
+function OC_textSig(tf, out) {
+  var chars = tf.characters, i, a;
+  if (chars.length > OC_SIG_TEXT_MAX) return false;
+  out.push(tf.contents, tf.kind, tf.geometricBounds.join(","));
+  for (i = 0; i < chars.length; i++) {
+    a = chars[i].characterAttributes;
+    out.push(a.textFont.name, a.size, a.fillColor.typename, a.strokeColor.typename, a.strokeWeight);
+  }
+  return true;
+}
+
+function OC_itemSig(item, out, depth) {
+  var t = item.typename, i;
+  if (depth > OC_MAX_DEPTH || out.length > OC_SIG_MAX) return false;
+  out.push(t, item.uuid, item.hidden);
+  if (t === "GroupItem") {
+    out.push(item.clipped);
+    for (i = 0; i < item.pageItems.length; i++) if (!OC_itemSig(item.pageItems[i], out, depth + 1)) return false;
+    return true;
+  }
+  if (t === "TextFrame") return OC_textSig(item, out);
+  if (t === "PathItem") { OC_pathSig(item, out); return true; }
+  if (t === "CompoundPathItem") {
+    for (i = 0; i < item.pathItems.length; i++) OC_pathSig(item.pathItems[i], out);
+    return true;
+  }
+  out.push(item.geometricBounds.join(","));
+  return true;
+}
+
+function OC_selectionSig(doc, list, axis, bias, keyUuid) {
+  var out = [doc.name, axis, bias, keyUuid], i;
+  try {
+    for (i = 0; i < doc.artboards.length; i++) out.push(doc.artboards[i].artboardRect.join(","));
+    for (i = 0; i < list.length; i++) if (!OC_itemSig(list[i].item, out, 0)) return null;
+  } catch (e) {
+    return null;
+  }
+  return out.join("|");
 }
 
 // One button press. action: "move" moves the selection, "preview" draws markers, "plan" only
 // returns the plan (used by tools/panel-e2e.js). Reading, planning and moving share this one
 // script call, so a move is one undo step, live text included.
 function OC_act(action, axis, bias, keyUuid, keyDoc, root) {
+  try {
+    if ($.global.OC_testFault === "slow") $.sleep(21000);
+    return OC_runAct(action, axis, bias, keyUuid, keyDoc, root);
+  } finally {
+    $.global.OC_testFault = null;
+  }
+}
+
+function OC_runAct(action, axis, bias, keyUuid, keyDoc, root) {
   return OC_run(function () {
-    var doc = OC_doc(), lib = OC_lib(root), sel, list = OC_selectionSorted(doc), i, d;
-    if (action === "move" && list.length && $.global.OC_centered === OC_selectionSig(doc, list, axis, bias, keyUuid)) {
-      var still = { moved: 0, deltas: [], labels: [], warnings: [] };
+    var doc = OC_doc(), lib = OC_lib(root), sel, list = OC_selectionSorted(doc), i, d, sig, hit = $.global.OC_centered;
+    if (action === "move" && list.length && hit && hit.sig === OC_selectionSig(doc, list, axis, bias, keyUuid)) {
+      var still = { moved: 0, movedIdx: [], deltas: [], labels: [], warnings: hit.warnings };
       for (i = 0; i < list.length; i++) { still.deltas.push({ dx: 0, dy: 0 }); still.labels.push(OC_describe(list[i].item)); }
       return still;
     }
-    sel = OC_readSelection(doc, list, keyUuid, keyDoc);
+    $.global.OC_lastCleanup = null;
+    try {
+      sel = OC_readSelection(doc, list, keyUuid, keyDoc);
+    } catch (e) {
+      // A copy left behind matters more than whatever else went wrong.
+      if ($.global.OC_lastCleanup) OC_fail("cleanup", $.global.OC_lastCleanup[0]);
+      throw e;
+    }
     var plan = OC_withES5(function () { return lib.planMove(sel.read, { bias: bias, axis: axis }); });
-    if (plan.error) OC_fail("plan", plan.error);
-    var out = { deltas: plan.deltas, labels: plan.labels, warnings: plan.warnings };
+    if (plan.error) OC_fail(sel.cleanup.length ? "cleanup" : "plan", sel.cleanup.length ? sel.cleanup[0] : plan.error);
+    var out = { deltas: plan.deltas, labels: plan.labels, warnings: sel.cleanup.concat(plan.warnings) };
     if (action === "plan") return out;
     if (action === "preview") { OC_drawMarkers(doc, plan.points); out.drawn = plan.points.length; return out; }
     // Re-measuring a centered object can come back a hair off; anything under 0.001 pt is not moved,
     // so a second press adds no undo step.
-    out.moved = 0;
+    out.movedIdx = [];
     for (i = 0; i < sel.list.length; i++) {
       d = plan.deltas[i];
       if (Math.abs(d.dx) < 0.001 && Math.abs(d.dy) < 0.001) continue;
       sel.list[i].item.translate(d.dx, d.dy);
-      out.moved++;
+      out.movedIdx.push(i);
     }
-    $.global.OC_centered = sel.withText ? OC_selectionSig(doc, sel.list, axis, bias, keyUuid) : null;
+    out.moved = out.movedIdx.length;
+    sig = sel.withText && !sel.cleanup.length ? OC_selectionSig(doc, sel.list, axis, bias, keyUuid) : null;
+    $.global.OC_centered = sig ? { sig: sig, warnings: plan.warnings } : null;
     return out;
   });
 }

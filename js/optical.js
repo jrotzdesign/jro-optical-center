@@ -194,7 +194,7 @@
   }
 
   // read: the engine's OC_read result. opts: { mode, bias (0..1), axis }.
-  // Returns { deltas, fingerprints, warnings, points } or { error }.
+  // Returns { deltas, labels, warnings, points, summary } or { error }.
   function artboardFor(read, bbox) {
     var cx = (bbox.minX + bbox.maxX) / 2, cy = (bbox.minY + bbox.maxY) / 2, i, a, pick;
     for (i = 0; i < read.artboards.length; i++) {
@@ -213,8 +213,10 @@
     read.items.forEach(function (it, i) { if (it.isKey) keyIndex = i; });
     mode = n === 1 ? 'artboard' : (keyIndex >= 0 ? 'key' : 'container');
 
+    var empty = null;
     var measured = read.items.map(function (it) {
       var own = [], shapes = itemShapes(it, own), bb = bounds(shapes), g = groupCentroid(shapes);
+      if (!isFinite(bb.minX) && empty === null) empty = it.label;
       own.forEach(function (w) { warnings.push(it.label + ': ' + w); });
       if (!isFinite(g.x) || !isFinite(g.y) || !(g.area > 1e-9)) {
         g = { x: (bb.minX + bb.maxX) / 2, y: (bb.minY + bb.maxY) / 2, crossing: false };
@@ -226,6 +228,7 @@
       return { bbox: bb, centroid: { x: g.x, y: g.y } };
     });
 
+    if (empty !== null) return { error: empty + ' has no fill or stroke, so there is nothing to measure.' };
     var anchor = mode === 'container' ? n - 1 : (mode === 'key' ? keyIndex : -1);
 
     if (mode === 'artboard') {
@@ -247,7 +250,6 @@
 
     return {
       deltas: deltas,
-      fingerprints: read.items.map(function (it) { return it.fingerprint; }),
       labels: read.items.map(function (it) { return it.label; }),
       warnings: warnings,
       points: points,

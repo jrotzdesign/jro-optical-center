@@ -2,7 +2,7 @@
 
 An Illustrator panel that centers objects by where their visual weight sits, not by their bounding box. A play triangle in a circle looks off-center when its box is centered, because most of the triangle's weight is on the left. Optical Center moves it right until the weight sits in the middle.
 
-Works in Illustrator 2024, 2025 and 2026 (tested on 30.4.0). Version 0.2.1.
+Works in Illustrator 2024, 2025 and 2026 (tested on 30.4.0). Version 0.2.2.
 
 ## Install
 
@@ -38,17 +38,21 @@ Fills are read straight from the paths. Strokes are turned into mass with math: 
 
 Live text is outlined on a copy inside your document, measured, and removed again, all within the same click. No other document opens and your text stays live. The measuring and the move happen in one script call, which is what keeps the move to one undo step.
 
+The copy is named "Optical Center measuring copy" and is unlocked and shown before outlining, so locked text inside a group measures normally. If text can't be copied or outlined, its box is used and the panel says so. After every text read the panel checks that the item count is back where it was and that no measuring copy is left. If a copy ever can't be removed, the panel names the text and tells you to delete "Optical Center measuring copy" in the Layers panel.
+
+An object with no fill and no stroke has nothing to measure, so its box is used, with a warning.
+
 ## Tests
 
 ```
 npm test
 ```
 
-47 unit tests cover `js/optical.js`: loading in all three hosts (Node, the CEP panel with Node enabled, ExtendScript), centroids, holes under even-odd and non-zero rules, bezier flattening, stroke bands, bounds, crossing detection and `planMove`.
+48 unit tests cover `js/optical.js`: loading in all three hosts (Node, the CEP panel with Node enabled, ExtendScript), centroids, holes under even-odd and non-zero rules, bezier flattening, stroke bands, bounds, crossing detection and `planMove`.
 
 In Illustrator, with the panel open:
 
-- `node tools/panel-e2e.js [screenshotDir]` drives the real panel through its debug port (`localhost:8733`). It opens a temporary copy of `test/fixtures/optical-center-test.ai`, clicks the buttons, and checks moves, undo, live text, layout fit and console errors. Any host call over 20 seconds stops the run. macOS only allows a real Cmd+Z keystroke if the terminal has Accessibility permission; otherwise the script uses Illustrator's Edit → Undo.
+- `node tools/panel-e2e.js [screenshotDir]` drives the real panel through its debug port (`localhost:8733`). It opens a temporary copy of `test/fixtures/optical-center-test.ai`, clicks the buttons, and checks moves, undo, live text, locked text, layout fit and console errors. It also makes each step of the text read fail on purpose (through the engine's one-shot `OC_testFault` hook), checks "Already centered" after edits that keep the bounds, and checks a 21-second reply. Any other host call over 20 seconds stops the run. macOS only allows a real Cmd+Z keystroke if the terminal has Accessibility permission; otherwise the script uses Illustrator's Edit → Undo.
 - `tools/stroke-compare.jsx` compares the stroke math with Outline Stroke on throwaway shapes in a scratch document.
 
 `test/fixtures/optical-center-test.ai` has five circle containers, each holding one subject centered by its box: a play triangle, a star, a live-text J, a compound path with a hole, and a stroke-only L. `tools/make-test-doc.jsx` rebuilds it if it is ever lost.
@@ -61,8 +65,9 @@ In Illustrator, with the panel open:
 - **Crossing or self-intersecting paths** get a warning. The center may be off.
 - **Very wide strokes on tight curves**: the inner edge of the band can fold over itself. The crossing warning shows when that happens.
 - **Images, symbols, meshes and plug-in objects** are measured by their bounding box, with a warning.
-- **Live text that's already centered** before the first press leaves one empty undo step, because outlining the copy counts as a change. After a move the panel remembers the result, so pressing again doesn't add one.
-- **Illustrator quirks the engine works around:** clearing and restoring the selection inside the move call stops Edit → Undo from reverting the move, so the engine never touches the selection. `zOrderPosition` is wrong for text frames, so stacking order comes from `pageItems`. ExtendScript has no `Array.prototype.forEach` and friends; the engine adds them only for the length of one call, because every panel shares that engine.
+- **Live text that's already centered** before the first press leaves one empty undo step, because outlining the copy counts as a change. After a move the panel remembers the result, so pressing again doesn't add one. It only trusts that memory while every path point, fill and stroke setting, text, font and size in the selection is unchanged; any edit means a fresh measurement.
+- **Slow replies:** while a script runs, Illustrator freezes the panel too, so nothing can be shown until it answers. If that takes more than 20 seconds, the result says how long it took, and clicks made in the meantime are ignored. The 20-second note only shows when Illustrator hasn't started the script yet, for example because a dialog is open.
+- **Illustrator quirks the engine works around:** clearing and restoring the selection inside the move call stops Edit → Undo from reverting the move, so the engine never touches the selection. Illustrator drops locked text, text on a locked layer, and groups whose members are all locked from the selection, so only a group with locked text and something unlocked reaches the engine. `$.evalFile` inside a function defines the file's functions in that function, so the panel reloads `engine.jsx` at the top level. `zOrderPosition` is wrong for text frames, so stacking order comes from `pageItems`. ExtendScript has no `Array.prototype.forEach` and friends; the engine adds them only for the length of one call, because every panel shares that engine.
 
 ## Fonts and license
 

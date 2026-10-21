@@ -12,11 +12,11 @@ const close = (actual, expected, eps = 1e-6) =>
 // At bias 0.6 the triangle's optical x is 82 (see optical.test.js), so moving it into the
 // container is dx = 18, and moving the container onto it is dx = -18.
 const container = {
-  label: 'container', isKey: false, fingerprint: 'c', warnings: [],
+  label: 'container', isKey: false, warnings: [],
   shapes: [shape([poly([[0, 0], [200, 0], [200, 200], [0, 200]])])],
 };
 const triangle = {
-  label: 'play', isKey: false, fingerprint: 't', warnings: [],
+  label: 'play', isKey: false, warnings: [],
   shapes: [shape([poly([[50, 50], [130, 100], [50, 150]])])],
 };
 // items are topmost first, as the engine sends them
@@ -41,7 +41,7 @@ const shifted = (item, dx) => ({
 test('two objects: the back-most is the container, the triangle moves 18 right', () => {
   const plan = planMove(read([triangle, container]), opts);
   assert.equal(plan.error, undefined);
-  assert.deepEqual(plan.fingerprints, ['t', 'c']);
+  assert.deepEqual(plan.labels, ['play', 'container']);
   close(plan.deltas[0].dx, 18);
   close(plan.deltas[0].dy, 0);
   assert.deepEqual(plan.deltas[1], { dx: 0, dy: 0 });
@@ -84,7 +84,7 @@ test('nothing selected: a plain-English error and no deltas', () => {
 
 test('a zero-area object falls back to its box center with a warning', () => {
   const line = {
-    label: 'rule', isKey: false, fingerprint: 'l', warnings: [],
+    label: 'rule', isKey: false, warnings: [],
     shapes: [shape([{ closed: false, polarity: 1, points: [pt(0, 0), pt(100, 0)] }])],
   };
   const plan = planMove(read([line]), { bias: 1, axis: 'both' });
@@ -96,7 +96,7 @@ test('a zero-area object falls back to its box center with a warning', () => {
 test('crossing paths produce a warning naming the object', () => {
   const a = poly([[0, 0], [100, 0], [100, 100], [0, 100]]);
   const b = poly([[50, 50], [150, 50], [150, 150], [50, 150]]);
-  const knot = { label: 'knot', isKey: false, fingerprint: 'k', warnings: [], shapes: [shape([a, b])] };
+  const knot = { label: 'knot', isKey: false, warnings: [], shapes: [shape([a, b])] };
   const plan = planMove(read([knot, container]), opts);
   assert.match(plan.warnings.join(' '), /knot.*cross/i);
 });
@@ -117,4 +117,12 @@ test('preview points: a box point per object, an optical point per mover, one ta
   const optical = plan.points.find((p) => p.kind === 'optical');
   close(optical.x, 82);
   close(optical.y, 100);
+});
+
+// An object with no fill and no stroke reaches planMove with no shapes at all. Its bounds are
+// infinite, which used to turn into NaN deltas and a failed translate() in Illustrator.
+test('an object with nothing to measure gives a plain error, never NaN', () => {
+  const empty = { label: 'J', isKey: false, warnings: [], pieces: [] };
+  assert.deepEqual(planMove(read([empty, container]), opts), { error: 'J has no fill or stroke, so there is nothing to measure.' });
+  assert.deepEqual(planMove(read([triangle, { ...empty, label: 'circle' }]), opts), { error: 'circle has no fill or stroke, so there is nothing to measure.' });
 });

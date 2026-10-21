@@ -1,15 +1,20 @@
 /* Compares stroke mass computed by optical.js (offset bands) with Illustrator's own Outline Stroke,
    on throwaway shapes in a scratch document that this script closes unsaved.
    Load order: jsx/engine.jsx, tools/integration-test.jsx (for OCT_load), then this file.
+   optical.js runs inside OC_withES5, so its ES5 helpers are gone again when this returns.
    Entry point: OCS_compare() returns report lines. */
 
 function OCS_measure(st, bias) {
-  var shapes = Optical.piecesToShapes(st.pieces), g = Optical.groupCentroid(shapes), b = Optical.bounds(shapes);
+  var Optical = OCT_load(), shapes = Optical.piecesToShapes(st.pieces), g = Optical.groupCentroid(shapes), b = Optical.bounds(shapes);
   var o = Optical.opticalPoint(b, { x: g.x, y: g.y }, bias, "both");
   return { area: g.area, ox: o.x, oy: o.y };
 }
 
 function OCS_compare() {
+  return OC_withES5(OCS_compareAll);
+}
+
+function OCS_compareAll() {
   var lines = [], scratch = null, oldLevel = app.userInteractionLevel, oldCS = app.coordinateSystem, back = app.documents.length ? app.activeDocument : null;
   try {
     app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;

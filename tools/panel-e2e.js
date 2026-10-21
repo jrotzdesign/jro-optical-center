@@ -53,7 +53,9 @@ async function connect() {
   const bounds = (name) => hostJSON(`(function(){var b=app.activeDocument.pageItems.getByName(${JSON.stringify(name)}).geometricBounds;return '['+b.join(',')+']';})()`);
   const docs = () => host('app.documents.length + ""').then(Number);
   const itemCount = () => host('app.activeDocument.pageItems.length + ""').then(Number);
-  const root = await p.evaluate('decodeURI(String(new CSInterface().getExtensionPath()).replace(/^file:\\/\\//, ""))');
+  const root = path.join(require('node:os').homedir(), 'Library', 'Application Support', 'Adobe', 'CEP', 'extensions', 'com.jro.opticalcenter');
+  const version = require('../package.json').version;
+  const strays = () => host('(function(){try{app.activeDocument.pageItems.getByName("Optical Center measuring copy");return "yes";}catch(e){return "no";}})()').then((r) => r === 'yes');
   const plan = (axis) => hostJSON(`OC_act("plan", ${JSON.stringify(axis)}, 0.6, "", "", ${JSON.stringify(root)})`);
   let undoMethod = null;
   const cmdZ = async () => {
@@ -87,10 +89,10 @@ async function connect() {
   if (missing) throw new Error('fixture copy is missing: ' + missing);
   await sleep(800);
 
-  // 0. Loaded properly: optical.js runs in the host, and its ES5 helpers do not outlive a call
+  // 0. Loaded properly: this version's engine, optical.js exporting planMove, no ES5 helpers left over
   await select([]);
-  const loaded = await plan('both').catch((e) => ({ ok: false, error: String(e) }));
-  check('optical.js loads in the host engine', loaded.ok === false && loaded.code === 'no-selection', loaded);
+  const ping = await hostJSON(`OC_ping(${JSON.stringify(root)})`);
+  check('engine ' + version + ' is loaded and optical.js exports planMove', ping.ok && ping.engine === version && ping.optical === true, ping);
   check('no ES5 helpers left on Array.prototype', (await host('typeof Array.prototype.forEach')) === 'undefined');
 
   // 1. Layout fits without scrolling: at the panel's current size and at the manifest default 268 x 340
@@ -189,6 +191,97 @@ async function connect() {
   await sleep(800);
   s = await panel();
   check('Set key with two selected: plain English', /Select just one object, then press Set key\./.test(s.status), s.status);
+
+  // 8. Locked text inside a selected group: measured on an unlocked copy, nothing left behind.
+  // Illustrator won't select locked art. It drops locked text, text on a locked layer, and a group
+  // whose children are all locked from the selection. The case a press can reach is a group with
+  // locked text and something unlocked, locked after selecting.
+  const grpSetup = await host('(function(){var d=app.activeDocument,J=d.pageItems.getByName("J"),K=d.pageItems.getByName("container-3");' +
+    'var g=d.activeLayer.groupItems.add();g.name="grp-locked";var t=J.duplicate();t.move(g,ElementPlacement.PLACEATEND);' +
+    'var r=d.activeLayer.pathItems.rectangle(J.geometricBounds[1],J.geometricBounds[0],4,4);r.move(g,ElementPlacement.PLACEATEND);' +
+    'd.selection=null;g.selected=true;K.selected=true;t.locked=true;return d.selection.length+"";})()');
+  await sleep(1800);
+  const gBefore = await bounds('grp-locked'), gItems = await itemCount(), gDocs = await docs();
+  await click('goBoth');
+  await waitIdle();
+  s = await panel();
+  const gAfter = await bounds('grp-locked');
+  check('locked text in a group: group and container stay selected', (await host('app.activeDocument.selection.length+""')) === '2');
+  check('locked text in a group: moves, no new document', grpSetup === '2' && Math.abs(gAfter[0] - gBefore[0]) > 0.1 && (await docs()) === gDocs, { status: s.status });
+  check('locked text in a group: no copy left, item count unchanged', !(await strays()) && (await itemCount()) === gItems && !/measuring copy/.test(s.status), { status: s.status });
+  await cmdZ(); await sleep(1000);
+  check('locked text in a group: one undo reverts', (await bounds('grp-locked')).every((v, i) => near(v, gBefore[i])));
+  check('locked text in a group: the original text stays locked', (await host('app.activeDocument.pageItems.getByName("grp-locked").textFrames[0].locked+""')) === 'true');
+  await host('(function(){var g=app.activeDocument.pageItems.getByName("grp-locked");g.textFrames[0].locked=false;g.remove();return "ok";})()');
+
+  // 9. Every failure in the text read, injected through the engine's test hook
+  const fault = async (name) => {
+    await select(['container-3', 'J']);
+    await host(`$.global.OC_testFault = ${JSON.stringify(name)}; "ok"`);
+    const before = await bounds('J'), items = await itemCount();
+    try { await click('goBoth'); await waitIdle(); } finally { await host('$.global.OC_testFault = null; "ok"'); }
+    const st = await panel(), after = await bounds('J');
+    return { status: st.status, moved: !after.every((v, i) => near(v, before[i])), before, after, items, itemsAfter: await itemCount(), stray: await strays() };
+  };
+  const undoTo = async (b) => { await cmdZ(); await sleep(1000); return (await bounds('J')).every((v, i) => near(v, b[i])); };
+  let f = await fault('dup-undefined');
+  check('fault dup-undefined: copy found and removed, J moves as normal', f.moved && near(f.after[0] - f.before[0], jPlan.deltas[0].dx, 0.01) && !f.stray && f.itemsAfter === f.items, f);
+  check('fault dup-undefined: one undo reverts', await undoTo(f.before));
+  f = await fault('dup-throws');
+  check('fault dup-throws: box used with a warning, nothing left', /copied for measuring, so its box was used/.test(f.status) && !f.stray && f.itemsAfter === f.items, f);
+  if (f.moved) check('fault dup-throws: one undo reverts', await undoTo(f.before));
+  f = await fault('outline');
+  check('fault outline: box used with a warning, copy removed', /outlined for measuring, so its box was used/.test(f.status) && !f.stray && f.itemsAfter === f.items, f);
+  if (f.moved) check('fault outline: one undo reverts', await undoTo(f.before));
+  f = await fault('remove');
+  check('fault remove: plain warning names the J and the copy', /A measuring copy of J couldn.t be removed\. Delete .Optical Center measuring copy. in the Layers panel\./.test(f.status), f.status);
+  check('fault remove: the leftover is findable by name', f.stray && f.itemsAfter > f.items, f);
+  await host('app.activeDocument.pageItems.getByName("Optical Center measuring copy").remove(); "ok"');
+  check('fault remove: item count back after deleting the leftover', (await itemCount()) === f.items);
+
+  // 10. "Already centered" re-measures after edits its old key missed (bounds and contents unchanged)
+  const edited = async (label, editJsx) => {
+    await select(['container-3', 'J']);
+    await click('goBoth'); await waitIdle(); // centers (or is centered); the result is remembered
+    await click('goBoth'); await waitIdle();
+    const centered = (await panel()).status.trim() === 'Already centered.';
+    const vb = () => host('(function(){var d=app.activeDocument;return d.pageItems.getByName("J").visibleBounds.join(",")+"|"+d.pageItems.getByName("container-3").visibleBounds.join(",");})()');
+    const vb0 = await vb();
+    await host(editJsx);
+    const sameBounds = (await vb()) === vb0;
+    const j0 = await bounds('J');
+    await click('goBoth'); await waitIdle();
+    const st = await panel(), j1 = await bounds('J');
+    check(`edit then press (${label}): re-measured and moved`, centered && sameBounds && st.status.trim() !== 'Already centered.' && !j1.every((v, i) => near(v, j0[i], 0.001)), { centered, sameBounds, status: st.status });
+  };
+  // Pull in the handles of the circle's top anchor: the curve flattens, the bounds stay.
+  await edited('path handles', '(function(){var c=app.activeDocument.pageItems.getByName("container-3"),pp=c.pathPoints,t=0,i;' +
+    'for(i=1;i<pp.length;i++)if(pp[i].anchor[1]>pp[t].anchor[1])t=i;var a=pp[t].anchor,l=pp[t].leftDirection,r=pp[t].rightDirection;' +
+    'pp[t].leftDirection=[(a[0]+l[0])/2,(a[1]+l[1])/2];pp[t].rightDirection=[(a[0]+r[0])/2,(a[1]+r[1])/2];return "ok";})()');
+  // Turn the J's fill off: no mass left, so its box center is used instead.
+  await edited('text fill off', '(function(){app.activeDocument.pageItems.getByName("J").textRange.characterAttributes.fillColor=new NoColor();return "ok";})()');
+
+  // 11. A reply slower than 20 s. Illustrator freezes the panel while the script runs, so the checks
+  // read the panel after the reply. A click sent mid-call is queued and delivered after the reply;
+  // it must not start a second press. Only a click() from a second debugger connection queues like
+  // that; a CDP mouse event or a click() on this connection lands while the panel is still busy.
+  await select(['container-4', 'hole']);
+  await sleep(1800);
+  const holeBefore = await bounds('hole');
+  const p2 = await connect();
+  await host('$.global.OC_testFault = "slow"; "ok"');
+  await click('goBoth');
+  await sleep(5000);
+  p2.send('Runtime.evaluate', { expression: 'document.getElementById("goBoth").click()' });
+  let late = await panel(); // answers once the panel unfreezes
+  for (let i = 0; i < 40 && !/^Moved hole/.test(late.status); i++) { await sleep(250); late = await panel(); }
+  await sleep(2500); // a second press, if one started, would have replaced the status by now
+  late = await panel();
+  const holeAfter = await bounds('hole');
+  p2.ws.close();
+  check('slow reply: the real result is shown with how long it took', /^Moved hole .*\nIllustrator took 2\d seconds to answer\./.test(late.status) && !late.disabled && !holeAfter.every((v, i) => near(v, holeBefore[i])), late);
+  check('slow reply: a click made during the call is dropped', !/Already centered/.test(late.status), late.status);
+  check('slow reply: the test delay was one-shot', (await host('String($.global.OC_testFault)')) === 'null');
 
   await select([]);
   await sleep(1200);

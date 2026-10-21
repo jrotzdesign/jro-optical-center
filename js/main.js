@@ -5,51 +5,78 @@
   var $ = function (id) { return document.getElementById(id); };
 
   var SEED = [{ name: "Play icon", bias: 70 }, { name: "Logomark", bias: 50 }];
+  var VERSION = "0.2.2"; // must match OC_ENGINE in jsx/engine.jsx
   var POLL_MS = 800;
-  var TIMEOUT_MS = 20000;
+  var SLOW_MS = 20000;
+  var DROP_MS = 1000;
 
-  // The extension folder, for the host to load js/optical.js from.
-  var ROOT = decodeURI(String(cs.getExtensionPath()).replace(/^file:\/\//, ""));
+  // The extension folder, for the host to load its files from. CEP reports it as a file:// URL.
+  var ROOT = (function (raw) {
+    raw = String(raw);
+    try { return (window.cep_node ? window.cep_node.require : window.require)("url").fileURLToPath(raw); } catch (e) {}
+    try { return decodeURIComponent(raw.replace(/^file:\/\//, "")); } catch (e2) {}
+    return raw.replace(/^file:\/\//, "");
+  })(cs.getExtensionPath());
 
   // Everything the user can see in the status line. Raw script errors never reach it.
   var MESSAGES = {
     "no-document": "Open a document first.",
     "no-selection": "Select a shape first.",
-    "selection-changed": "The selection changed while measuring. Try again.",
     "key-needs-one": "Select just one object, then press Set key.",
-    "copy-failed": "Some text couldn't be measured. Outline it and try again.",
     "no-answer": "Illustrator didn't answer. Close any open dialog and try again.",
-    "timeout": "Illustrator took longer than 20 seconds. Check the artwork before you try again.",
+    "slow": "Illustrator is taking longer than 20 seconds. If a dialog is open, close it. The buttons unlock when it answers.",
+    "optical-missing": "Some of the panel's files are missing. Reinstall Optical Center.",
+    "engine-reload": "The panel's script couldn't be reloaded, so it's using the copy Illustrator loaded at startup. If something looks wrong, quit and reopen Illustrator.",
+    "engine-missing": "The panel's script couldn't be loaded. Quit and reopen Illustrator. If that doesn't help, reinstall Optical Center.",
     "internal": "Something went wrong. Try again, or close and reopen the panel."
   };
 
-  var state = { bias: 60, key: null, presets: [], busy: false, peek: null };
+  var state = { bias: 60, key: null, presets: [], busy: false, peek: null, idleAt: 0, dropUntil: 0 };
 
   // ---------- host calls ----------
 
   function PanelError(code, detail) { this.code = code; this.detail = detail; }
 
+  // A slow call can't be cancelled, so the panel waits for the real answer with the buttons locked.
+  // While a script runs, Illustrator freezes this panel too, so the 20 s note can only show when
+  // Illustrator is held up before the script starts (an open dialog). The reply carries ms, and a
+  // reply that took longer than 20 s says so next to the result.
+  function evalHost(script, quiet) {
+    var started = Date.now();
+    return new Promise(function (resolve) {
+      var slow = setTimeout(function () {
+        console.info("[Optical Center] still waiting after " + SLOW_MS + " ms: " + script.slice(0, 80));
+        if (!quiet) setStatus("err", MESSAGES.slow);
+      }, SLOW_MS);
+      cs.evalScript(script, function (raw) {
+        var ms = Date.now() - started;
+        clearTimeout(slow);
+        if (ms > SLOW_MS) state.dropUntil = performance.now() + DROP_MS;
+        resolve({ raw: raw, ms: ms });
+      });
+    });
+  }
+
+  function tookNote(res) {
+    return res.ms > SLOW_MS ? ["Illustrator took " + Math.round(res.ms / 1000) + " seconds to answer."] : [];
+  }
+
   function host(fn) {
     var args = Array.prototype.slice.call(arguments, 1).map(function (a) { return JSON.stringify(a); });
-    return new Promise(function (resolve, reject) {
-      var done = false;
-      var timer = setTimeout(function () { done = true; reject(new PanelError("timeout", fn + " took over " + TIMEOUT_MS + " ms")); }, TIMEOUT_MS);
-      cs.evalScript(fn + "(" + args.join(",") + ")", function (raw) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        if (typeof raw !== "string" || raw.charAt(0) !== "{") { reject(new PanelError("no-answer", raw)); return; }
-        var res;
-        try { res = JSON.parse(raw); } catch (e) { reject(new PanelError("internal", "unparseable reply: " + raw.slice(0, 120))); return; }
-        if (!res.ok) reject(new PanelError(res.code || "internal", res.error)); else resolve(res);
-      });
+    return evalHost(fn + "(" + args.join(",") + ")", fn === "OC_peek").then(function (reply) {
+      var raw = reply.raw, res;
+      if (typeof raw !== "string" || raw.charAt(0) !== "{") throw new PanelError("no-answer", raw);
+      try { res = JSON.parse(raw); } catch (e) { throw new PanelError("internal", "unparseable reply: " + raw.slice(0, 120)); }
+      if (!res.ok) throw new PanelError(res.code || "internal", res.error);
+      res.ms = reply.ms;
+      return res;
     });
   }
 
   function plain(e) {
     if (e instanceof PanelError) {
-      if (e.code === "plan") return e.detail;
-      if (e.code === "internal" || e.code === "no-answer" || e.code === "timeout") console.info("[Optical Center] " + e.code + ": " + e.detail);
+      if (e.code === "plan" || e.code === "cleanup") return e.detail;
+      if (e.code === "internal" || e.code === "no-answer" || e.code === "optical-missing") console.info("[Optical Center] " + e.code + ": " + e.detail);
       return MESSAGES[e.code] || MESSAGES.internal;
     }
     console.info("[Optical Center] " + (e && e.stack ? e.stack : e));
@@ -77,15 +104,15 @@
     return cap(movers.length === 1 ? movers[0] : movers.length + " objects") + " center" + (movers.length === 1 ? "s" : "") + " inside " + anchor + ".";
   }
 
+  // Uses the engine's own list of what it moved.
   function movedLine(res, axis) {
-    if (!res.moved) return "Already centered.";
-    var moving = [];
-    res.deltas.forEach(function (d, i) { if (Math.abs(d.dx) >= 0.001 || Math.abs(d.dy) >= 0.001) moving.push(i); });
-    if (moving.length !== 1) return "Moved " + res.moved + " objects" + (axis === "h" ? " horizontally." : axis === "v" ? " vertically." : ".");
-    var d = res.deltas[moving[0]], parts = [];
+    var n = res.movedIdx.length;
+    if (!n) return "Already centered.";
+    if (n > 1) return "Moved " + n + " objects" + (axis === "h" ? " horizontally." : axis === "v" ? " vertically." : ".");
+    var i = res.movedIdx[0], d = res.deltas[i], parts = [];
     if (Math.abs(d.dx) >= 0.05) parts.push(pt(d.dx) + (d.dx > 0 ? " right" : " left"));
     if (Math.abs(d.dy) >= 0.05) parts.push(pt(d.dy) + (d.dy > 0 ? " up" : " down"));
-    return parts.length ? "Moved " + res.labels[moving[0]] + " " + parts.join(" and ") + "." : "Already centered.";
+    return "Moved " + res.labels[i] + " " + (parts.length ? parts.join(" and ") : "less than 0.1 pt") + ".";
   }
 
   // ---------- status and controls ----------
@@ -107,7 +134,22 @@
     ["goBoth", "goH", "goV", "preview"].forEach(function (id) { $(id).disabled = !can; });
   }
 
-  function setBusy(b) { state.busy = b; renderPeek(); }
+  function setBusy(b) {
+    state.busy = b;
+    if (!b) state.idleAt = performance.now();
+    renderPeek();
+  }
+
+  // Clicks made while Illustrator had the panel frozen are delivered after the reply. Anything
+  // stamped before the panel went idle again is dropped, and so is any click in the first second
+  // after a slow reply, in case a queued click is stamped with its delivery time instead.
+  function fresh(handler) {
+    return function (ev) {
+      if (ev && ev.timeStamp < state.idleAt) return;
+      if (performance.now() < state.dropUntil) return;
+      handler();
+    };
+  }
 
   // ---------- presets (JSON on disk, through the panel's Node access) ----------
 
@@ -212,7 +254,7 @@
     // Markers are cleared in their own call so one undo reverts only the move.
     host("OC_clearMarkers")
       .then(function () { return hostAct("move", axis); })
-      .then(function (res) { setStatus("ok", movedLine(res, axis), res.warnings); })
+      .then(function (res) { setStatus("ok", movedLine(res, axis), tookNote(res).concat(res.warnings)); })
       .catch(function (e) { setStatus("err", plain(e)); })
       .then(function () { setBusy(false); });
   }
@@ -221,7 +263,7 @@
     if (state.busy) return;
     setBusy(true);
     hostAct("preview", "both")
-      .then(function (res) { setStatus("ok", "Markers drawn. They clear on the next move.", res.warnings); })
+      .then(function (res) { setStatus("ok", "Markers drawn. They clear on the next move.", tookNote(res).concat(res.warnings)); })
       .catch(function (e) { setStatus("err", plain(e)); })
       .then(function () { setBusy(false); });
   }
@@ -243,11 +285,11 @@
 
     $("bias").addEventListener("input", function () { setBias(this.value); });
     $("biasNum").addEventListener("change", function () { setBias(this.value); });
-    $("goBoth").addEventListener("click", function () { act("both"); });
-    $("goH").addEventListener("click", function () { act("h"); });
-    $("goV").addEventListener("click", function () { act("v"); });
-    $("preview").addEventListener("click", preview);
-    $("setKey").addEventListener("click", setKey);
+    $("goBoth").addEventListener("click", fresh(function () { act("both"); }));
+    $("goH").addEventListener("click", fresh(function () { act("h"); }));
+    $("goV").addEventListener("click", fresh(function () { act("v"); }));
+    $("preview").addEventListener("click", fresh(preview));
+    $("setKey").addEventListener("click", fresh(setKey));
     $("clearKey").addEventListener("click", function () { state.key = null; renderKey(); setStatus("", "Key cleared."); });
     $("savePreset").addEventListener("click", function () {
       var name = $("presetName").value.trim();
@@ -260,14 +302,40 @@
       setStatus("ok", "Saved " + name + " at " + state.bias + "%.");
     });
 
-    // Illustrator loads engine.jsx once per session; loading it again here keeps the host code in
-    // step with this panel after a reinstall or reload.
-    new Promise(function (resolve) { cs.evalScript("$.evalFile(" + JSON.stringify(ROOT + "/jsx/engine.jsx") + ")", resolve); })
+    var note = presetNote;
+    loadEngine()
+      .then(function (engineNote) { if (engineNote) note = engineNote; })
       // A marker layer left behind by a crash or a closed panel should not survive a reopen.
       .then(function () { return host("OC_clearMarkers"); })
-      .then(function (res) { if (res.removed) setStatus("", "Removed leftover markers."); })
+      .then(function (res) { if (res.removed && !note) setStatus("", "Removed leftover markers."); })
       .catch(function () {})
-      .then(function () { if (presetNote) setStatus("err", presetNote); poll(); });
+      .then(function () { if (note) setStatus("err", note); poll(); });
+  }
+
+  // Illustrator loads engine.jsx once per session; loading it again here keeps the host code in step
+  // with this panel after a reinstall or reload. If that fails, the copy loaded at startup is used.
+  // Resolves to a message for the status line, or "" when all is well.
+  function loadEngine() {
+    var file = JSON.stringify(ROOT + "/jsx/engine.jsx");
+    // Top level on purpose: $.evalFile inside a function defines the file's functions in that
+    // function's scope, so nothing would be replaced. The try statement's value is the reply.
+    var script = "try{$.evalFile(new File(" + file + "));'loaded';}" +
+      "catch(e){'failed: '+e.message+(e.line?' (line '+e.line+')':'');}";
+    var reloaded = false;
+    return evalHost(script)
+      .then(function (reply) {
+        reloaded = reply.raw === "loaded";
+        if (!reloaded) console.info("[Optical Center] engine reload " + reply.raw);
+        return host("OC_ping", ROOT);
+      })
+      .then(function (p) {
+        if (p.engine !== VERSION) { console.info("[Optical Center] engine " + p.engine + ", panel " + VERSION); return MESSAGES["engine-reload"]; }
+        return reloaded ? "" : MESSAGES["engine-reload"];
+      })
+      .catch(function (e) {
+        console.info("[Optical Center] engine check: " + (e.detail || e));
+        return e instanceof PanelError && e.code === "optical-missing" ? MESSAGES["optical-missing"] : MESSAGES["engine-missing"];
+      });
   }
 
   init();
